@@ -27,26 +27,37 @@ b.cells.append(nbf.v4.new_markdown_cell(text_intro))
 
 # Cell 2: Setup
 code_setup = r"""# @title 1. Environment Setup & Imports
-# We check for GPU availability and install CuPy if needed (standard on Colab).
+# We check for GPU availability and install CuPy if needed.
 
 import sys
 import os
 import time
+import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
+
+def install_cupy_fallback():
+    print("CuPy not found or incompatible. Attempting clean install of cupy-cuda11x (broad compatibility)...")
+    # Uninstall existing to avoid conflicts
+    subprocess.run(['pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'])
+    # Install 11x which works on Drivers 11.x AND 12.x
+    subprocess.run(['pip', 'install', 'cupy-cuda11x'])
 
 try:
     import cupy as cp
     import cupyx.scipy.sparse as cpx
     import cupyx.scipy.sparse.csgraph as cpx_graph
+    # Test actual GPU access to catch Driver errors
+    cp.array([1])
     print(f"GPU Detected: {cp.cuda.runtime.getDeviceCount()} device(s)")
-except ImportError:
-    print("CuPy not found. Installing...")
-    !pip install cupy-cuda12x
+except Exception as e:
+    print(f"Initial GPU check failed: {e}")
+    install_cupy_fallback()
     import cupy as cp
     import cupyx.scipy.sparse as cpx
     import cupyx.scipy.sparse.csgraph as cpx_graph
+    print("Re-import successful.")
 
 # Graphics settings
 plt.style.use('dark_background')
