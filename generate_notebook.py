@@ -418,7 +418,7 @@ if compare_baseline:
 
 plt.xlabel('MC Steps')
 plt.ylabel('Fraction Unsatisfied (Energy)')
-plt.title(f'3-SAT Optimization: N={N}, $\alpha$={alpha}')
+plt.title(f'3-SAT Optimization: N={N}, $\\alpha$={alpha}')
 plt.legend()
 plt.grid(True, alpha=0.2)
 plt.show()"""
