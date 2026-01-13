@@ -34,6 +34,7 @@ import os
 import subprocess
 import time
 import warnings
+import requests
 
 # Function to force install a compatible CuPy
 def install_compatible_cupy():
