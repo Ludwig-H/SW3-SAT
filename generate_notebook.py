@@ -27,41 +27,49 @@ b.cells.append(nbf.v4.new_markdown_cell(text_intro))
 
 # Cell 2: Setup
 code_setup = r"""# @title 1. Environment Setup & Imports
-# We check for GPU availability and install CuPy if needed.
+# We check for GPU availability and ensure the CuPy version matches the Driver.
 
 import sys
 import os
-import time
 import subprocess
-import numpy as np
-import matplotlib.pyplot as plt
-import requests
+import time
+import warnings
 
-def install_cupy_fallback():
-    print("CuPy not found or incompatible. Attempting clean install of cupy-cuda11x (broad compatibility)...")
-    # Uninstall existing to avoid conflicts
-    subprocess.run(['pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'])
-    # Install 11x which works on Drivers 11.x AND 12.x
-    subprocess.run(['pip', 'install', 'cupy-cuda11x'])
+# Function to force install a compatible CuPy
+def install_compatible_cupy():
+    print("Installing cupy-cuda11x (broad compatibility)...")
+    subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'], check=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', 'cupy-cuda11x'], check=True)
+    print("Installation complete. Restarting runtime to apply changes...")
+    # Kill the current process to force Colab/Jupyter to restart the kernel
+    os.kill(os.getpid(), 9)
 
 try:
     import cupy as cp
-    import cupyx.scipy.sparse as cpx
-    import cupyx.scipy.sparse.csgraph as cpx_graph
-    # Test actual GPU access to catch Driver errors
-    cp.array([1])
+    # aggressive check: try to allocate and execute a small kernel
+    x = cp.array([1.0, 2.0])
+    y = x * x
     print(f"GPU Detected: {cp.cuda.runtime.getDeviceCount()} device(s)")
+    print(f"CuPy Version: {cp.__version__}")
+except ImportError:
+    print("CuPy not installed.")
+    install_compatible_cupy()
 except Exception as e:
-    print(f"Initial GPU check failed: {e}")
-    install_cupy_fallback()
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-    import cupyx.scipy.sparse.csgraph as cpx_graph
-    print("Re-import successful.")
+    # Catch CUDARuntimeError or generic exceptions related to driver mismatch
+    print(f"GPU/CuPy check failed: {e}")
+    if "InsufficientDriver" in str(e) or "cudaErrorInsufficientDriver" in str(e):
+        print("Driver is too old for the installed CuPy runtime.")
+    install_compatible_cupy()
+
+import numpy as np
+import matplotlib.pyplot as plt
+import cupyx.scipy.sparse as cpx
+import cupyx.scipy.sparse.csgraph as cpx_graph
 
 # Graphics settings
 plt.style.use('dark_background')
-plt.rcParams['figure.figsize'] = (12, 6)"""
+plt.rcParams['figure.figsize'] = (12, 6)
+"""
 b.cells.append(nbf.v4.new_code_cell(code_setup))
 
 # Cell 3: Data Gen
