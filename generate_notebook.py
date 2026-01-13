@@ -84,6 +84,9 @@ b.cells.append(nbf.v4.new_code_cell(code_setup))
 # Cell 3: Data Gen
 code_data = r'''# @title 2. Data Generation & Parsing
 
+import gzip
+import io
+
 def generate_random_3sat(N, alpha, seed=None):
     """
     Generates a Random 3-SAT instance.
@@ -103,24 +106,61 @@ def generate_random_3sat(N, alpha, seed=None):
     clauses = vars * signs
     return clauses, N
 
-def parse_dimacs(content):
+def parse_dimacs(content_str):
     """Parses DIMACS CNF content string."""
     clauses = []
     N = 0
-    for line in content.splitlines():
+    for line in content_str.splitlines():
         line = line.strip()
-        if not line or line.startswith('c'): continue
+        if not line or line.startswith('c') or line.startswith('%'): continue
         if line.startswith('p'):
             parts = line.split()
-            N = int(parts[2])
+            try:
+                N = int(parts[2])
+            except:
+                pass # sometimes header is malformed
             continue
         
         # Parse literals
-        lits = [int(x) for x in line.split() if x != '0']
-        if len(lits) == 3:
-            clauses.append(lits)
+        try:
+            lits = [int(x) for x in line.split() if x != '0']
+            if len(lits) >= 3:
+                # We take the first 3 literals for 3-SAT (truncating if >3, though ideal is proper 3-SAT)
+                # Or skip if not 3-SAT? For now, we assume input is 3-SAT.
+                # If length < 3, we might need padding.
+                # Let's strictly take triplets or skip.
+                if len(lits) == 3:
+                    clauses.append(lits)
+        except ValueError:
+            continue
             
-    return np.array(clauses, dtype=np.int32), N
+    # Auto-detect N if header failed
+    clauses_np = np.array(clauses, dtype=np.int32)
+    if N == 0 and len(clauses_np) > 0:
+        N = np.max(np.abs(clauses_np))
+        
+    return clauses_np, N
+
+def download_and_parse_instance(url):
+    """Downloads and parses a CNF instance (supports .cnf and .cnf.gz)."""
+    print(f"Downloading {url}...")
+    response = requests.get(url)
+    response.raise_for_status()
+    
+    content = response.content
+    
+    # Check if gzipped
+    if url.endswith('.gz'):
+        try:
+            with gzip.open(io.BytesIO(content), 'rt') as f:
+                text_content = f.read()
+        except Exception as e:
+            print(f"Error decompressing: {e}")
+            return None, 0
+    else:
+        text_content = content.decode('utf-8')
+        
+    return parse_dimacs(text_content)
 
 print("Generators ready.")'''
 b.cells.append(nbf.v4.new_code_cell(code_data))
@@ -786,61 +826,84 @@ b.cells.append(nbf.v4.new_code_cell(code_baseline))
 # Cell 6: Execution
 code_exec = """# @title 5. Execution & Benchmarking
 
-# Parameters
-N = 2000          # Number of variables (Large!)
-alpha = 4.2       # Hard regime (near phase transition)
+# Configuration
+SOURCE = "SATLIB (uf250)" # @param ["Random", "SATLIB (uf250)", "Custom URL"]
+CUSTOM_URL = "" # @param {type:"string"}
+
+# Random Params
+N = 2000          # Number of variables (for Random)
+alpha = 4.2       # Clause density (for Random)
+
+# Solver Params
 steps = 500       # Simulation steps
 omega = 3.5       # Interaction strength (Tetra)
 beta_base = 4.0   # Inv Temp (Metropolis)
 compare_baseline = True # @param {type:"boolean"} 
 
-print(f"Generating Random 3-SAT: N={N}, M={int(alpha*N)}...")
-clauses, real_N = generate_random_3sat(N, alpha, seed=42)
+# Load Data
+if SOURCE == "Random":
+    print(f"Generating Random 3-SAT: N={N}, M={int(alpha*N)}...")
+    clauses, real_N = generate_random_3sat(N, alpha, seed=42)
+elif SOURCE == "SATLIB (uf250)":
+    # Example hard instance from SATLIB
+    url = "https://www.cs.ubc.ca/~hoos/SATLIB/Benchmarks/SAT/RND3SAT/uf250-1065/uf250-01.cnf"
+    print(f"Fetching {url}...")
+    clauses, real_N = download_and_parse_instance(url)
+else:
+    if not CUSTOM_URL:
+        print("Error: Please provide a Custom URL.")
+        clauses, real_N = np.array([]), 0
+    else:
+        clauses, real_N = download_and_parse_instance(CUSTOM_URL)
 
-# --- Run Tetra Dynamics ---
-print("Initializing TetraDynamicsGPU...")
-tetra_solver = TetraDynamicsGPU(clauses, real_N, omega=omega)
+if len(clauses) == 0:
+    print("No valid clauses found. Exiting.")
+else:
+    print(f"Loaded Instance: N={real_N}, M={len(clauses)}")
 
-metro_energies = []
-tetra_energies = []
-start_t = time.time()
-for i in range(steps):
-    tetra_solver.step()
-    if i % 10 == 0:
-        e = tetra_solver.energy().item()
-        tetra_energies.append(e)
-        # print(f"Step {i}: E={e:.4f}")
-end_t = time.time()
-print(f"Tetra Dynamics Time: {end_t - start_t:.2f}s")
+    # --- Run Tetra Dynamics ---
+    print("Initializing TetraDynamicsGPU...")
+    tetra_solver = TetraDynamicsGPU(clauses, real_N, omega=omega)
 
-# --- Run Baseline (Optional) ---
-metro_energies = []
-if compare_baseline:
-    print("Initializing MetropolisGPU...")
-    metro_solver = MetropolisGPU(clauses, real_N, beta=beta_base)
-    
+    tetra_energies = []
     start_t = time.time()
     for i in range(steps):
-        metro_solver.step()
+        tetra_solver.step()
         if i % 10 == 0:
-            e = metro_solver.energy().item()
-            metro_energies.append(e)
+            e = tetra_solver.energy().item()
+            tetra_energies.append(e)
+            # print(f"Step {i}: E={e:.4f}")
     end_t = time.time()
-    print(f"Metropolis Time: {end_t - start_t:.2f}s")
+    print(f"Tetra Dynamics Time: {end_t - start_t:.2f}s")
 
-# --- Plotting ---
-x_axis = np.arange(0, steps, 10)
-plt.figure()
-plt.plot(x_axis, tetra_energies, label='Tetra Cluster Dynamics (Ours)', color='cyan', linewidth=2)
-if compare_baseline:
-    plt.plot(x_axis, metro_energies, label='Standard Metropolis', color='orange', alpha=0.7)
+    # --- Run Baseline (Optional) ---
+    metro_energies = []
+    if compare_baseline:
+        print("Initializing MetropolisGPU...")
+        metro_solver = MetropolisGPU(clauses, real_N, beta=beta_base)
+        
+        start_t = time.time()
+        for i in range(steps):
+            metro_solver.step()
+            if i % 10 == 0:
+                e = metro_solver.energy().item()
+                metro_energies.append(e)
+        end_t = time.time()
+        print(f"Metropolis Time: {end_t - start_t:.2f}s")
 
-plt.xlabel('MC Steps')
-plt.ylabel('Fraction Unsatisfied (Energy)')
-plt.title(rf'3-SAT Optimization: N={N}, $\\alpha$={alpha}')
-plt.legend()
-plt.grid(True, alpha=0.2)
-plt.show()"""
+    # --- Plotting ---
+    x_axis = np.arange(0, steps, 10)
+    plt.figure()
+    plt.plot(x_axis, tetra_energies, label='Tetra Cluster Dynamics (Ours)', color='cyan', linewidth=2)
+    if compare_baseline:
+        plt.plot(x_axis, metro_energies, label='Standard Metropolis', color='orange', alpha=0.7)
+
+    plt.xlabel('MC Steps')
+    plt.ylabel('Fraction Unsatisfied (Energy)')
+    plt.title(rf'3-SAT Optimization: N={real_N}, M={len(clauses)}')
+    plt.legend()
+    plt.grid(True, alpha=0.2)
+    plt.show()"""
 b.cells.append(nbf.v4.new_code_cell(code_exec))
 
 with open('sw3sat_colab.ipynb', 'w') as f:
