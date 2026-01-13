@@ -38,9 +38,18 @@ import warnings
 # Function to force install a compatible CuPy
 def install_compatible_cupy():
     print("Installing cupy-cuda11x (broad compatibility)...")
-    subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'], check=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', 'cupy-cuda11x'], check=True)
-    print("Installation complete. Restarting runtime to apply changes...")
+    try:
+        subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'], check=True)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', 'cupy-cuda11x'], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Installation failed: {e}")
+        return
+
+    print("Installation complete.")
+    print("⚠️ CRITICAL: The runtime will now RESTART automatically to load the new library.")
+    print("⚠️ You may see a 'Session Crashed' or 'Kernel Restarting' message. This is NORMAL.")
+    print("⚠️ AFTER the restart, please RE-RUN this cell manually.")
+    time.sleep(2)
     # Kill the current process to force Colab/Jupyter to restart the kernel
     os.kill(os.getpid(), 9)
 
