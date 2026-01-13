@@ -87,6 +87,7 @@ code_data = r'''# @title 2. Data Generation & Parsing
 
 import gzip
 import io
+import tarfile
 
 def generate_random_3sat(N, alpha, seed=None):
     """
@@ -143,23 +144,49 @@ def parse_dimacs(content_str):
     return clauses_np, N
 
 def download_and_parse_instance(url):
-    """Downloads and parses a CNF instance (supports .cnf and .cnf.gz)."""
+    """Downloads and parses a CNF instance (supports .cnf, .cnf.gz, .tar.gz)."""
     print(f"Downloading {url}...")
-    response = requests.get(url)
-    response.raise_for_status()
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Download Error: {e}")
+        return np.array([]), 0
     
     content = response.content
+    text_content = None
     
-    # Check if gzipped
-    if url.endswith('.gz'):
+    # 1. Check for tar.gz
+    if url.endswith('.tar.gz') or url.endswith('.tgz'):
         try:
-            with gzip.open(io.BytesIO(content), 'rt') as f:
+            with tarfile.open(fileobj=io.BytesIO(content), mode='r:gz') as tar:
+                # Find first .cnf file
+                for member in tar.getmembers():
+                    if member.name.endswith('.cnf'):
+                        print(f"Extracting {member.name} from archive...")
+                        f = tar.extractfile(member)
+                        if f:
+                            text_content = f.read().decode('utf-8', errors='ignore')
+                            break
+                if text_content is None:
+                    print("No .cnf file found in archive.")
+                    return np.array([]), 0
+        except Exception as e:
+            print(f"Error extracting tar.gz: {e}")
+            return np.array([]), 0
+            
+    # 2. Check for .gz (single file)
+    elif url.endswith('.gz'):
+        try:
+            with gzip.open(io.BytesIO(content), 'rt', encoding='utf-8', errors='ignore') as f:
                 text_content = f.read()
         except Exception as e:
-            print(f"Error decompressing: {e}")
-            return None, 0
+            print(f"Error decompressing .gz: {e}")
+            return np.array([]), 0
+            
+    # 3. Plain text
     else:
-        text_content = content.decode('utf-8')
+        text_content = content.decode('utf-8', errors='ignore')
         
     return parse_dimacs(text_content)
 
@@ -847,7 +874,7 @@ if SOURCE == "Random":
     clauses, real_N = generate_random_3sat(N, alpha, seed=42)
 elif SOURCE == "SATLIB (uf250)":
     # Example hard instance from SATLIB
-    url = "https://www.cs.ubc.ca/~hoos/SATLIB/Benchmarks/SAT/RND3SAT/uf250-1065/uf250-01.cnf"
+    url = "https://www.cs.ubc.ca/~hoos/SATLIB/Benchmarks/SAT/RND3SAT/uf250-1065.tar.gz"
     print(f"Fetching {url}...")
     clauses, real_N = download_and_parse_instance(url)
 else:
