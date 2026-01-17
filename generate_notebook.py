@@ -1,938 +1,605 @@
 import json
-import nbformat as nbf
 
-b = nbf.v4.new_notebook()
+# Define the notebook structure
+notebook = {
+    "cells": [],
+    "metadata": {
+        "kernelspec": {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {
+            "codemirror_mode": {
+                "name": "ipython",
+                "version": 3
+            },
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "name": "python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3",
+            "version": "3.8.5"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 4
+}
 
-# Cell 1: Intro
-text_intro = r"""# Higher-Order Monte Carlo Cluster Dynamics for 3-SAT (GPU)
+def add_markdown(source_string):
+    lines = [line + "\n" for line in source_string.splitlines()]
+    if lines: lines[-1] = lines[-1].rstrip("\n")
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": lines
+    })
 
-This notebook implements a high-performance **Swendsen-Wang Cluster Dynamics** solver for 3-SAT problems, adapted from the physics of **spatially embedded graphs** and **frustrated systems** (referencing *SODA 2026* and *Asilomar 2025*).
+def add_code(source_string):
+    lines = [line + "\n" for line in source_string.splitlines()]
+    if lines: lines[-1] = lines[-1].rstrip("\n")
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": lines
+    })
 
-## The Physics
-Instead of treating SAT clauses as simple constraints, we map them to **Tetrahedrons** (4-body interactions). By distributing energy onto these higher-order structures and utilizing a specific decision tree for bond percolation, we can:
-1.  Minimize the number of "frozen" bonds (reducing frustration).
-2.  Maintain the correct Gibbs measure.
-3.  Accelerate sampling via cluster updates.
+# --- Content ---
 
-## Algorithm Architecture
-The implementation follows a strict **Array Programming** paradigm using **CuPy** (CUDA for Python) to ensure massive parallelism.
+# 1. Intro Markdown
+# Using raw string r"""...""" to handle LaTeX backslashes correctly without escaping them for Python
+intro_text = r"""# Higher-Order Swendsen-Wang Dynamics for 3-SAT (Triangle + Tetrahedron)
 
-*   **Mapping:** 3-SAT Clauses $\to$ Tetrahedrons (via Ghost/Slack nodes).
-*   **Dynamics:** 3-State Bond Sampling ($B=0, 1, 2$) based on satisfaction levels $k$.
-*   **Witness Selection:** Vectorized "Random Priority" mechanism (no loops).
-*   **Cluster Flipping:** Ghost-Node Graph construction + Connected Components on GPU.
+This notebook implements a cutting-edge **Cluster Monte Carlo** algorithm for solving 3-SAT problems, bridging Statistical Physics and Combinatorial Optimization.
 
----"""
-b.cells.append(nbf.v4.new_markdown_cell(text_intro))
+## The Physics Model
+We map the 3-SAT problem onto a **Spatially Embedded Spin System** with higher-order interactions.
 
-# Cell 2: Setup
-code_setup = r"""# @title 1. Environment Setup & Imports
-# We check for GPU availability and ensure the CuPy version matches the Driver.
+### 1. Variables & Geometry
+Consider $N$ variables $\sigma_i \in \{-1, +1\}$. We augment the graph with a "Ghost Node" $\sigma_0 = +1$ (representing TRUE).
+Each 3-SAT clause $C_m = (l_1 \lor l_2 \lor l_3)$ is encoded by two geometric structures:
+1.  **A Triangle ($\\mathcal{T}$)**: Connecting the 3 variables involved in the clause.
+2.  **A Tetrahedron ($\\mathcal{K}$)**: Connecting the Triangle to the Ghost Node $\sigma_0$.
 
+### 2. Interactions & Colors
+The edges are colored (signed) to encode the literals:
+*   **Triangle Edges**: An edge $(i, j)$ is **Antiferromagnetic** (Red, $J=-1$) if literals $l_i, l_j$ have the **same sign**. It is **Ferromagnetic** (Blue, $J=+1$) if they have **opposite signs**. This makes the triangle *Inherently Contradictory* (Frustrated).
+*   **Tetrahedron Edges**: An edge $(0, i)$ connecting to the Ghost is Ferromagnetic if $l_i$ is positive ($x_i$), and Antiferromagnetic if $l_i$ is negative ($\\neg x_i$). 
+
+### 3. Dynamics & Weights
+We introduce a coupling parameter $\\omega$ (playing the role of inverse temperature/interaction strength).
+
+*   **Tetrahedron (Weight $\\omega$)**: If the clause is **FULLY SATISFIED** (ALL 3 literals match $\\sigma_0$), we freeze the **entire tetrahedron** (all 3 edges) with probability $1 - e^{-\\omega}$.
+*   **Triangle (Weight $\\omega/2$)**: The triangle is an *isotropic inherently contradictory* loop. It fluctuates between two energy levels:
+    *   **Low Energy ($\\E_0 = \\omega/2$)**: 1 unsatisfied edge (Frustration limit).
+    *   **High Energy ($\\E_1 = 3\\omega/2$)**: 3 unsatisfied edges.
+    *   **Dynamics**: We follow the *SODA 2026 / Asilomar 2025* prescription (Table 3.1) to freeze specific subsets of edges based on the configuration state.
+*   **Ghost Node Invariant**: The Ghost Node $\\sigma_0$ represents the "TRUE" state (+1). If it flips to -1 after a cluster update, we flip the entire system ($\\sigma \to -\\sigma$) to restore the gauge.
+
+### 4. Energy Landscape
+The global Hamiltonian is constructed such that:
+*   **Satisfied Clause**: Energy $\\mathcal{H} = 3\\omega/2$.
+*   **Unsatisfied Clause**: Energy $\\mathcal{H} = 5\\omega/2$.
+
+We perform **Simulated Annealing** by increasing $\\omega$ over time, effectively lowering the temperature.
+
+""" # This is the end of intro_text
+
+add_markdown(intro_text)
+
+# 2. Setup Code
+setup_code = """# @title 1. Environment & GPU Setup
 import sys
 import os
 import subprocess
 import time
-import warnings
-import requests
-
-# Function to force install a compatible CuPy
-def install_compatible_cupy():
-    print("Installing cupy-cuda11x (broad compatibility)...")
-    try:
-        subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'cupy', 'cupy-cuda12x', 'cupy-cuda11x'], check=True)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', 'cupy-cuda11x'], check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Installation failed: {e}")
-        return
-
-    print("Installation complete.")
-    print("⚠️ CRITICAL: The runtime will now RESTART automatically to load the new library.")
-    print("⚠️ You may see a 'Session Crashed' or 'Kernel Restarting' message. This is NORMAL.")
-    print("⚠️ AFTER the restart, please RE-RUN this cell manually.")
-    time.sleep(2)
-    # Kill the current process to force Colab/Jupyter to restart the kernel
-    os.kill(os.getpid(), 9)
-
-try:
-    import cupy as cp
-    # aggressive check: try to allocate and execute a small kernel
-    x = cp.array([1.0, 2.0])
-    y = x * x
-    print(f"GPU Detected: {cp.cuda.runtime.getDeviceCount()} device(s)")
-    print(f"CuPy Version: {cp.__version__}")
-except ImportError:
-    print("CuPy not installed.")
-    install_compatible_cupy()
-except Exception as e:
-    # Catch CUDARuntimeError or generic exceptions related to driver mismatch
-    print(f"GPU/CuPy check failed: {e}")
-    if "InsufficientDriver" in str(e) or "cudaErrorInsufficientDriver" in str(e):
-        print("Driver is too old for the installed CuPy runtime.")
-    install_compatible_cupy()
-
 import numpy as np
 import matplotlib.pyplot as plt
-import cupyx.scipy.sparse as cpx
-import cupyx.scipy.sparse.csgraph as cpx_graph
-
-# Graphics settings
-plt.style.use('dark_background')
-plt.rcParams['figure.figsize'] = (12, 6)
-"""
-b.cells.append(nbf.v4.new_code_cell(code_setup))
-
-# Cell 3: Data Gen
-code_data = r'''# @title 2. Data Generation & Parsing
-
-import gzip
-import io
+import requests
 import tarfile
+import io
+import gzip
+
+# Ensure CuPy is available
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx
+    import cupyx.scipy.sparse.csgraph as cpx_graph
+    print(f"GPU Detected: {cp.cuda.runtime.getDeviceCount()} device(s)")
+except ImportError:
+    print("Installing CuPy...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'cupy-cuda12x'])
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx
+    import cupyx.scipy.sparse.csgraph as cpx_graph
+
+plt.style.use('dark_background')
+print("Environment Ready.")"""
+add_code(setup_code)
+
+# 3. Data Gen Code
+data_gen_code = """# @title 2. Data Generators (Random & SATLIB)
 
 def generate_random_3sat(N, alpha, seed=None):
-    """
-    Generates a Random 3-SAT instance.
-    N: Number of variables
-    alpha: Ratio of clauses/variables (M = alpha * N)
-    Returns: (M, 3) array of literals (1-based index, negative for NOT)
-    """
-    if seed is not None:
-        np.random.seed(seed)
-    
+    if seed is not None: np.random.seed(seed)
     M = int(N * alpha)
-    # Variables are 1..N
     vars = np.random.randint(1, N + 1, size=(M, 3))
-    # Signs are +/- 1
     signs = np.random.choice([-1, 1], size=(M, 3))
-    
-    clauses = vars * signs
-    return clauses, N
+    return vars * signs, N
 
-def parse_dimacs(content_str):
-    """Parses DIMACS CNF content string."""
+def parse_dimacs(content):
     clauses = []
     N = 0
-    for line in content_str.splitlines():
+    for line in content.splitlines():
         line = line.strip()
-        if not line or line.startswith('c') or line.startswith('%'): continue
-        if line.startswith('p'):
-            parts = line.split()
-            try:
-                N = int(parts[2])
-            except:
-                pass # sometimes header is malformed
+        if not line or line.startswith(('c', '%')):
             continue
-        
-        # Parse literals
+        if line.startswith('p'):
+            N = int(line.split()[2])
+            continue
         try:
             lits = [int(x) for x in line.split() if x != '0']
-            if len(lits) >= 3:
-                # We take the first 3 literals for 3-SAT (truncating if >3, though ideal is proper 3-SAT)
-                # Or skip if not 3-SAT? For now, we assume input is 3-SAT.
-                # If length < 3, we might need padding.
-                # Let's strictly take triplets or skip.
-                if len(lits) == 3:
-                    clauses.append(lits)
-        except ValueError:
-            continue
-            
-    # Auto-detect N if header failed
-    clauses_np = np.array(clauses, dtype=np.int32)
-    if N == 0 and len(clauses_np) > 0:
-        N = np.max(np.abs(clauses_np))
-        
-    return clauses_np, N
-
-def download_and_parse_instance(url):
-    """Downloads and parses a CNF instance (supports .cnf, .cnf.gz, .tar.gz)."""
-    print(f"Downloading {url}...")
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Download Error: {e}")
-        return np.array([]), 0
-    
-    content = response.content
-    text_content = None
-    
-    # 1. Check for tar.gz
-    if url.endswith('.tar.gz') or url.endswith('.tgz'):
-        try:
-            with tarfile.open(fileobj=io.BytesIO(content), mode='r:gz') as tar:
-                # Find first .cnf file
-                for member in tar.getmembers():
-                    if member.name.endswith('.cnf'):
-                        print(f"Extracting {member.name} from archive...")
-                        f = tar.extractfile(member)
-                        if f:
-                            text_content = f.read().decode('utf-8', errors='ignore')
-                            break
-                if text_content is None:
-                    print("No .cnf file found in archive.")
-                    return np.array([]), 0
-        except Exception as e:
-            print(f"Error extracting tar.gz: {e}")
-            return np.array([]), 0
-            
-    # 2. Check for .gz (single file)
-    elif url.endswith('.gz'):
-        try:
-            with gzip.open(io.BytesIO(content), 'rt', encoding='utf-8', errors='ignore') as f:
-                text_content = f.read()
-        except Exception as e:
-            print(f"Error decompressing .gz: {e}")
-            return np.array([]), 0
-            
-    # 3. Plain text
-    else:
-        text_content = content.decode('utf-8', errors='ignore')
-        
-    return parse_dimacs(text_content)
-
-print("Generators ready.")'''
-b.cells.append(nbf.v4.new_code_cell(code_data))
-
-# Cell 4: Solver
-# Using triple single quotes. IMPORTANT: Fixed dtype to float32 for cuSPARSE compat
-code_solver = r'''# @title 3. The Solver: `TetraDynamicsGPU`
-# Implements the Generalized Higher-Order Cluster Dynamics (m=2, 3, 4) + Residual Triangles.
-
-class TetraDynamicsGPU:
-    def __init__(self, clauses_np, N, omega=2.0):
-        """
-        Initialize the Generalized Higher-Order Cluster Solver.
-        clauses_np: (M, 3) numpy array of literals (int32).
-        N: Number of variables.
-        omega: Energy scaling parameter.
-        """
-        self.N = N
-        self.raw_clauses = clauses_np # For global energy check
-        self.omega = omega
-        
-        # --- 1. Topology Builder: Decompose Clauses into Tetrahedrons & Triangles ---
-        # We greedily find tetrahedrons (cliques of 4 vars sharing >=2 clauses).
-        print("Decomposing graph topology...")
-        tetras, triangles = self._build_topology(clauses_np)
-        print(f"Topology: {len(tetras)} Tetrahedrons, {len(triangles)} Residual Triangles.")
-        
-        # --- 2. Prepare Data for GPU (Tetrahedrons) ---
-        # We flatten the tetrahedron list for vectorized ops.
-        # tetras structure: list of dicts {'indices': [4], 'signs': [4], 'active': [4 (bool)], 'm': int}
-        
-        self.num_tetras = len(tetras)
-        if self.num_tetras > 0:
-            t_indices = np.array([t['indices'] for t in tetras], dtype=np.int32)
-            t_signs   = np.array([t['signs'] for t in tetras], dtype=np.int8)
-            t_active  = np.array([t['active'] for t in tetras], dtype=bool)
-            t_m       = np.array([t['m'] for t in tetras], dtype=np.int8)
-            
-            self.t_indices = cp.array(t_indices)
-            self.t_signs   = cp.array(t_signs)
-            self.t_active  = cp.array(t_active) # Mask: True if node is in Active Set A
-            self.t_m       = cp.array(t_m)
-        else:
-            self.t_indices = cp.empty((0, 4), dtype=cp.int32)
-            
-        # --- 3. Prepare Data for GPU (Residual Triangles) ---
-        self.num_tris = len(triangles)
-        if self.num_tris > 0:
-            r_indices = np.array([t['indices'] for t in triangles], dtype=np.int32)
-            r_signs   = np.array([t['signs'] for t in triangles], dtype=np.int8)
-            
-            self.r_indices = cp.array(r_indices)
-            self.r_signs   = cp.array(r_signs)
-        else:
-            self.r_indices = cp.empty((0, 3), dtype=cp.int32)
-
-        # Initialize Spins
-        self.spins = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N + 1)
-        # We don't strictly need a dummy node for this logic, but we keep structure consistent
-        # if we ever need it. The Ghost nodes are virtual (N+1, N+2).
-        
-        # Ghost Node Indices
-        self.GHOST_PLUS = N + 1
-        self.GHOST_MINUS = N + 2
-        self.TOTAL_NODES = N + 3
-        
-        # --- 4. Precompute Probabilities ---
-        # We need thresholds for B=0, B=1, B=2 based on U and m.
-        # Store as dictionaries or small arrays? 
-        # Since we vectorize, we will compute probabilities on the fly or look them up.
-        # Constants:
-        self.exp_w  = np.exp(-1.0 * omega)
-        self.exp_2w = np.exp(-2.0 * omega)
-        self.exp_3w = np.exp(-3.0 * omega)
-        self.exp_4w = np.exp(-4.0 * omega)
-
-    def _build_topology(self, clauses):
-        """
-        Decomposes the clause list into Tetrahedrons (m=2,3,4) and Residual Triangles.
-        Greedy strategy: Prioritize higher m.
-        """
-        # 1. Map Edges (pair of literals) to Clauses
-        # "Edge" here means two variables sharing a link in the factor graph.
-        # The prompt specifies: "two triangles share an edge (two signed literals)".
-        # So we key by (lit1, lit2) sorted.
-        
-        from collections import defaultdict
-        
-        # Each clause is identified by its index in the original list
-        # Store clauses as sets of literals
-        clause_sets = []
-        for c in clauses:
-            clause_sets.append(tuple(sorted(c)))
-            
-        active_clauses = set(range(len(clauses)))
-        
-        # Map: Edge (lit_a, lit_b) -> set of clause_indices
-        edge_map = defaultdict(set)
-        for idx, literals in enumerate(clause_sets):
-            # 3 edges per clause
-            l = literals
-            edge_map[tuple(sorted((l[0], l[1])))].add(idx)
-            edge_map[tuple(sorted((l[0], l[2])))].add(idx)
-            edge_map[tuple(sorted((l[1], l[2])))].add(idx)
-            
-        tetras = []
-        
-        # Search for Tetrahedrons
-        # Potential tetrahedrons are formed by pairs of clauses sharing an edge.
-        # We iterate edges that have >= 2 clauses.
-        
-        # To avoid duplicates, we track "consumed" clauses.
-        # Heuristic: Check edges with most clauses first? Or just iterate.
-        
-        # Because N might be large, we need to be efficient. 
-        # We'll just iterate all edges with size >= 2.
-        
-        candidates = [] # (m, clause_indices_tuple, literals_tuple)
-        
-        checked_pairs = set()
-
-        for edge, c_indices in edge_map.items():
-            if len(c_indices) < 2:
-                continue
-            
-            # Check all pairs in this edge list
-            c_list = list(c_indices)
-            for i in range(len(c_list)):
-                for j in range(i + 1, len(c_list)):
-                    idx1, idx2 = c_list[i], c_list[j]
-                    
-                    # Form a candidate 4-set
-                    l1 = set(clause_sets[idx1])
-                    l2 = set(clause_sets[idx2])
-                    union_l = l1 | l2
-                    
-                    if len(union_l) != 4:
-                        # Should be 4 if they share exactly 2 literals (an edge)
-                        continue
-                        
-                    key = tuple(sorted(list(union_l)))
-                    if key in checked_pairs:
-                        continue
-                    checked_pairs.add(key)
-                    
-                    # Now check how many faces of this 4-set exist in 'clause_sets'
-                    # The 4-set has 4 faces (triplets).
-                    # We count how many are in our full list.
-                    
-                    # Generate 4 faces
-                    import itertools
-                    faces_found = [] # store indices
-                    
-                    # Map triplet -> original index? Slow to search list.
-                    # We can't easily search `clause_sets` if not hashed.
-                    # Let's verify presence using a set of all clauses.
-                    
-                    # Optimization: Only check this if we haven't consumed these.
-                    # But we are in the candidate gathering phase.
-                    
-                    # Count 'm'
-                    m_count = 0
-                    faces_indices = []
-                    
-                    # Check the 4 combinations
-                    u_list = sorted(list(union_l))
-                    possible_faces = list(itertools.combinations(u_list, 3))
-                    
-                    found_indices = []
-                    
-                    # We need to find the ID of these faces.
-                    # Build a lookup: triplet -> ID
-                    # Doing this once at start
-                    
-                    pass 
-        
-        # --- optimized topology pass ---
-        # Re-build for speed
-        
-        clause_to_id = {c: i for i, c in enumerate(clause_sets)}
-        
-        candidates = []
-        
-        # Iterating edges again
-        seen_tetra = set()
-        
-        for edge, c_indices in edge_map.items():
-            if len(c_indices) < 2: continue
-            c_list = list(c_indices)
-            
-            for i in range(len(c_list)):
-                for j in range(i+1, len(c_list)):
-                    idx1 = c_list[i]
-                    idx2 = c_list[j]
-                    
-                    l1 = set(clause_sets[idx1])
-                    l2 = set(clause_sets[idx2])
-                    union_l = sorted(list(l1 | l2))
-                    
-                    if len(union_l) != 4: continue
-                    
-                    t_key = tuple(union_l)
-                    if t_key in seen_tetra: continue
-                    seen_tetra.add(t_key)
-                    
-                    # Check faces
-                    # We know idx1 and idx2 are present.
-                    # Check the other 2 possible faces.
-                    
-                    import itertools
-                    faces = list(itertools.combinations(union_l, 3))
-                    
-                    found_faces = []
-                    for face in faces:
-                        f_tuple = tuple(sorted(face))
-                        if f_tuple in clause_to_id:
-                            found_faces.append(clause_to_id[f_tuple])
-                            
-                    m = len(found_faces)
-                    if m >= 2:
-                        candidates.append({
-                            'm': m,
-                            'clauses': found_faces,
-                            'literals': union_l
-                        })
-                        
-        # Sort candidates by m descending
-        candidates.sort(key=lambda x: x['m'], reverse=True)
-        
-        # Greedy Assignment
-        final_tetras = []
-        consumed_mask = np.zeros(len(clauses), dtype=bool)
-        
-        for cand in candidates:
-            # Check if any clause is already consumed
-            if any(consumed_mask[idx] for idx in cand['clauses']):
-                continue
-                
-            # Consume
-            for idx in cand['clauses']:
-                consumed_mask[idx] = True
-                
-            # Build Tetra Object
-            # Need to define 'Active' mask.
-            # "Active" node is one opposite to an Active Face.
-            # Active Face = a clause that exists (is in cand['clauses']).
-            
-            # Map literals to 0..3 local indices
-            lits = cand['literals'] # the 4 literals (signed)
-            
-            # Store indices (abs(lit)-1) and signs
-            indices = [abs(x)-1 for x in lits]
-            signs = [int(np.sign(x)) for x in lits]
-            
-            active_mask = [False] * 4
-            
-            # Check each vertex v. If face opposite to v is in 'cand['clauses']', v is active.
-            # Face opposite to local index i is the triplet excluding i.
-            import itertools
-            for i in range(4):
-                # Form face excluding i
-                face_lits = [lits[k] for k in range(4) if k != i]
-                face_tuple = tuple(sorted(face_lits))
-                
-                # Is this face in our consumed list?
-                # We need to check if face_tuple corresponds to one of the consumed IDs
-                # Using lookup
-                if face_tuple in clause_to_id:
-                    if clause_to_id[face_tuple] in cand['clauses']:
-                        active_mask[i] = True
-            
-            final_tetras.append({
-                'indices': indices,
-                'signs': signs,
-                'active': active_mask,
-                'm': cand['m']
-            })
-            
-        # Collect Residuals
-        final_tris = []
-        for i in range(len(clauses)):
-            if not consumed_mask[i]:
-                c = clause_sets[i]
-                final_tris.append({
-                    'indices': [abs(x)-1 for x in c],
-                    'signs': [int(np.sign(x)) for x in c]
-                })
-                
-        return final_tetras, final_tris
-
-    def step(self):
-        """
-        Swendsen-Wang Step with Generalized Dynamics.
-        """
-        # --- 1. Tetrahedrons Dynamics ---
-        if self.num_tetras > 0:
-            # Gather spins (T, 4)
-            t_spins = self.spins[self.t_indices]
-            # Check sat (T, 4)
-            is_sat = (t_spins == self.t_signs)
-            # k: num sat (T,)
-            k = cp.sum(is_sat, axis=1)
-            
-            # Determine Energy State U
-            # Conditions:
-            # U = 0 if (k >= 2) OR (k==1 AND sat_node is Inactive)
-            # U = w if (k == 1 AND sat_node is Active)
-            # U = m*w if (k == 0)
-            
-            # Identify if the single satisfied node is Active (for k=1 case)
-            # sat_and_active = is_sat & self.t_active
-            # is_sat_active_any = cp.any(sat_and_active, axis=1)
-            
-            # We can compute U directly or implicit probabilities.
-            # Let's map to a State Index S:
-            # 0: Energy mw (k=0)
-            # 1: Energy w  (k=1, Active)
-            # 2: Energy 0  (k>=2 or k=1 Inactive)
-            
-            state = cp.zeros(self.num_tetras, dtype=cp.int8) # Default 0 (k=0)
-            
-            # Mask k=1
-            mask_k1 = (k == 1)
-            # Check if the sat node is Active
-            # For k=1, exactly one is_sat is True. is_sat & t_active gives True if that one is active.
-            mask_k1_active = mask_k1 & cp.any(is_sat & self.t_active, axis=1)
-            mask_k1_inactive = mask_k1 & (~mask_k1_active)
-            
-            mask_k_ge_2 = (k >= 2)
-            
-            # Assign states
-            # State 0 is default
-            state[mask_k1_active] = 1
-            state[mask_k1_inactive] = 2
-            state[mask_k_ge_2] = 2
-            
-            # Generate Bond B (0, 1, 2)
-            # We need vectorized random sampling based on State and m.
-            # Probabilities depend on m.
-            # We can use a unified random number u.
-            
-            u = cp.random.random(self.num_tetras, dtype=cp.float32)
-            bonds = cp.zeros(self.num_tetras, dtype=cp.int8)
-            
-            # We must apply rules for m=2,3,4.
-            # To vectorize efficiently, we can lookup thresholds based on (m, state).
-            # Or handle each m separately. Separating by m is clearer.
-            
-            for m_val in [2, 3, 4]:
-                mask_m = (self.t_m == m_val)
-                if not cp.any(mask_m): continue
-                
-                # Sub-masks
-                mask_S0 = mask_m & (state == 0) # U = mw
-                mask_S1 = mask_m & (state == 1) # U = w
-                mask_S2 = mask_m & (state == 2) # U = 0
-                
-                # --- State 0 (k=0) ---
-                # P(B=0)=1. Always 0.
-                
-                # --- State 1 (k=1 Active) ---
-                # Energy w.
-                # P(B=0) = e^{-(m-1)w}
-                # P(B=1) = 1 - P(B=0)
-                # P(B=2) = 0
-                p_b0_s1 = cp.exp(-(m_val - 1) * self.omega)
-                
-                mask_S1_B1 = mask_S1 & (u >= p_b0_s1)
-                bonds[mask_S1_B1] = 1
-                
-                # --- State 2 (Energy 0) ---
-                # P(B=0) = e^{-mw}
-                # P(B=1) = e^{-w} - e^{-mw}
-                # P(B=2) = 1 - e^{-w}
-                
-                p_b0_s2 = cp.exp(-m_val * self.omega)
-                p_b1_cum_s2 = cp.exp(-1.0 * self.omega) # P(B<=1) = e^{-w}
-                
-                # B=1 if p_b0 <= u < p_b1_cum
-                mask_S2_B1 = mask_S2 & (u >= p_b0_s2) & (u < p_b1_cum_s2)
-                bonds[mask_S2_B1] = 1
-                
-                # B=2 if u >= p_b1_cum
-                mask_S2_B2 = mask_S2 & (u >= p_b1_cum_s2)
-                bonds[mask_S2_B2] = 2
-            
-            # --- Witness Selection (Vectorized) ---
-            # Generate random priorities for all nodes in tetrahedrons
-            priorities = cp.random.random((self.num_tetras, 4), dtype=cp.float32)
-            
-            # Arrays to store witnesses (Global Indices)
-            # We can have up to 2 witnesses per tetra.
-            # Initialize with -1 (no witness)
-            w1_global = cp.full(self.num_tetras, -1, dtype=cp.int32)
-            w2_global = cp.full(self.num_tetras, -1, dtype=cp.int32)
-            w1_sign   = cp.zeros(self.num_tetras, dtype=cp.int8)
-            w2_sign   = cp.zeros(self.num_tetras, dtype=cp.int8)
-            
-            # --- Case B=1: Freeze 1 Satisfied Node ---
-            mask_active_1 = (bonds >= 1) # B=1 or B=2 both need at least 1 witness
-            
-            # Priority Logic: "1er sommet satisfait dans l'ordre pi"
-            # Mask priorities of unsatisfied nodes to -1
-            p_sat = priorities.copy()
-            p_sat[~is_sat] = -2.0 # Unsatisfied
-            
-            # Select Max Priority
-            idx_w1 = cp.argmax(p_sat, axis=1) # Local index 0..3
-            
-            # Store w1 for Active bonds
-            w1_global = cp.where(mask_active_1, 
-                                 cp.take_along_axis(self.t_indices, idx_w1[:, None], axis=1).flatten(),
-                                 w1_global)
-            w1_sign = cp.where(mask_active_1,
-                               cp.take_along_axis(self.t_signs, idx_w1[:, None], axis=1).flatten(),
-                               w1_sign)
-            
-            # --- Case B=2: Freeze 2nd Node OR Inactive Node ---
-            mask_B2 = (bonds == 2)
-            
-            # Logic:
-            # if exists sat node in Inactive (I): Freeze 1 such node (already done in B=1 step? No.)
-            # Wait, the rule for B=2 says:
-            # "si existe +1 sur I: geler 1 inactif (+1). Sinon: geler 2 sommets (+1)."
-            
-            # So, for B=2, we must check if we picked an Inactive node as w1?
-            # Or does "1er inactif (+1)" imply we prioritize Inactive?
-            # "si existe +1 sur I: geler 1 tel sommet (le premier dans pi parmi ceux-là)."
-            # This implies a priority filter: Filter for (Sat AND Inactive). If not empty, pick max.
-            # Else (if only Active sat), pick top 2 Sat.
-            
-            # We need to refine w1 selection for B=2 specifically.
-            # Let's re-calculate w1, w2 for B=2 rows.
-            
-            if cp.any(mask_B2):
-                # Subset of data for B=2
-                # This is tricky to do in-place vectorized without masking.
-                # Let's just adjust the priorities for B=2 case before argmax?
-                # No, B=1 and B=2 have different selection rules for w1.
-                
-                # Correction:
-                # B=1: Any Sat.
-                # B=2: Priority to Inactive Sat.
-                
-                # Let's compute specific targets for B=2
-                
-                # Check existence of Sat+Inactive
-                has_sat_inactive = cp.any(is_sat & (~self.t_active), axis=1)
-                
-                # Sub-mask for B=2
-                mask_B2_Inactive = mask_B2 & has_sat_inactive
-                mask_B2_ActiveOnly = mask_B2 & (~has_sat_inactive)
-                
-                # For mask_B2_Inactive: Pick max priority among (Sat & Inactive)
-                # We can modify p_sat temporary for these rows?
-                # Better: construct specific mask.
-                
-                # 1. Update w1 for B=2 & Inactive
-                # mask out Active nodes in priority
-                p_sat_inactive = p_sat.copy()
-                p_sat_inactive[self.t_active] = -2.0 # Mask active
-                
-                idx_w1_inactive = cp.argmax(p_sat_inactive, axis=1)
-                
-                # Apply update
-                w1_global = cp.where(mask_B2_Inactive, 
-                                     cp.take_along_axis(self.t_indices, idx_w1_inactive[:,None], axis=1).flatten(),
-                                     w1_global)
-                w1_sign = cp.where(mask_B2_Inactive,
-                                   cp.take_along_axis(self.t_signs, idx_w1_inactive[:,None], axis=1).flatten(),
-                                   w1_sign)
-                                   
-                # w2 remains -1 for this case (only 1 witness needed)
-                
-                # 2. Update w1, w2 for B=2 & Active Only (Need 2 witnesses)
-                # w1 is already picked correctly (Max of Sat) because only Active are Sat.
-                # We just need w2 (2nd Max of Sat).
-                
-                # Mask the chosen w1
-                p_sat_w2 = p_sat.copy()
-                rows = cp.arange(self.num_tetras)
-                # We need the local index of the current w1 to mask it.
-                # Recover local index?
-                # argmax was used on p_sat.
-                idx_w1_current = cp.argmax(p_sat, axis=1)
-                
-                p_sat_w2[rows, idx_w1_current] = -3.0
-                
-                idx_w2 = cp.argmax(p_sat_w2, axis=1)
-                
-                # Apply
-                w2_global = cp.where(mask_B2_ActiveOnly,
-                                     cp.take_along_axis(self.t_indices, idx_w2[:,None], axis=1).flatten(),
-                                     w2_global)
-                w2_sign = cp.where(mask_B2_ActiveOnly,
-                                   cp.take_along_axis(self.t_signs, idx_w2[:,None], axis=1).flatten(),
-                                   w2_sign)
-
-            # Store edges for graph
-            # Active B >= 1
-            mask_has_w1 = (bonds >= 1)
-            mask_has_w2 = (w2_global != -1)
-            
-            src_t1 = w1_global[mask_has_w1]
-            tgt_t1 = cp.where(w1_sign[mask_has_w1] > 0, self.GHOST_PLUS, self.GHOST_MINUS)
-            
-            src_t2 = w2_global[mask_has_w2]
-            tgt_t2 = cp.where(w2_sign[mask_has_w2] > 0, self.GHOST_PLUS, self.GHOST_MINUS)
-        
-        else:
-            # Empty placeholders
-            src_t1, tgt_t1 = cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)
-            src_t2, tgt_t2 = cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)
-
-
-        # --- 2. Residual Triangles Dynamics ---
-        if self.num_tris > 0:
-            # Gather spins
-            r_spins = self.spins[self.r_indices]
-            # Sat
-            r_is_sat = (r_spins == self.r_signs)
-            r_clause_sat = cp.any(r_is_sat, axis=1)
-            
-            # Sampling: Only if satisfied
-            # P(Freeze) = 1 - e^-w
-            p_freeze = 1.0 - self.exp_w
-            u_r = cp.random.random(self.num_tris, dtype=cp.float32)
-            
-            mask_freeze = r_clause_sat & (u_r < p_freeze)
-            
-            # Select 1 witness (Random Sat)
-            r_priorities = cp.random.random((self.num_tris, 3), dtype=cp.float32)
-            r_priorities[~r_is_sat] = -1.0
-            
-            idx_r_w1 = cp.argmax(r_priorities, axis=1)
-            
-            # Extract
-            src_r = cp.take_along_axis(self.r_indices, idx_r_w1[:,None], axis=1).flatten()[mask_freeze]
-            sign_r = cp.take_along_axis(self.r_signs, idx_r_w1[:,None], axis=1).flatten()[mask_freeze]
-            tgt_r = cp.where(sign_r > 0, self.GHOST_PLUS, self.GHOST_MINUS)
-            
-        else:
-            src_r, tgt_r = cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)
-            
-        # --- 3. Graph Construction & Cluster Flip ---
-        all_src = cp.concatenate([src_t1, src_t2, src_r])
-        all_tgt = cp.concatenate([tgt_t1, tgt_t2, tgt_r])
-        
-        if len(all_src) > 0:
-            weights = cp.ones(len(all_src), dtype=cp.float32)
-            # Create CSR Matrix
-            adj = cpx.coo_matrix((weights, (all_src, all_tgt)), shape=(self.TOTAL_NODES, self.TOTAL_NODES), dtype=cp.float32)
-            adj = adj.tocsr()
-            adj = adj + adj.T
-            
-            # Components
-            n_components, labels = cpx_graph.connected_components(adj, directed=False)
-            
-            # Determine Ghost Labels
-            l_plus = labels[self.GHOST_PLUS]
-            l_minus = labels[self.GHOST_MINUS]
-            
-            # Random Flips
-            comp_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_components)
-            
-            new_spins = comp_flips[labels[:self.N+1]]
-            
-            # Fix Ghosts
-            mask_plus = (labels[:self.N+1] == l_plus)
-            mask_minus = (labels[:self.N+1] == l_minus)
-            
-            new_spins[mask_plus] = 1
-            new_spins[mask_minus] = -1
-            
-            # Conflict handling (Rare)
-            mask_conflict = mask_plus & mask_minus
-            if cp.any(mask_conflict):
-                new_spins[mask_conflict] = self.spins[mask_conflict] # Freeze to old
-                
-            self.spins = new_spins
-        else:
-            # No bonds? Just flip everything randomly? 
-            # Standard SW: If no edges, every node is a cluster.
-            # Here we haven't built the full graph of N nodes, only witnessing edges.
-            # Implicitly, nodes not in 'all_src' are singletons.
-            # They should flip 50/50.
-            # The code above relies on 'labels' covering all nodes.
-            # If adj is empty, connected_components returns N components (if shape is correct).
-            # But coo_matrix shape is (TOTAL, TOTAL), so it should work.
-            
-            # However, empty COO might be tricky.
+            if len(lits) == 3:
+                clauses.append(lits)
+        except:
             pass
+    return np.array(clauses, dtype=np.int32), N
+
+def download_instance(url):
+    print(f"Downloading {url}...")
+    resp = requests.get(url)
+    content = resp.content
+    if url.endswith('.tar.gz'):
+        with tarfile.open(fileobj=io.BytesIO(content), mode='r:gz') as tar:
+            for m in tar.getmembers():
+                if m.name.endswith('.cnf'):
+                    return parse_dimacs(tar.extractfile(m).read().decode('utf-8'))
+    return parse_dimacs(content.decode('utf-8'))"""
+add_code(data_gen_code)
+
+# 4. Solver Code
+# Note: Using raw string r"""...""" for code block as well just in case, though standard triple quote is usually fine.
+solver_code = r"""# @title 3. The Solver: `SwendsenWangTrianglesGPU`
+
+class SwendsenWangTrianglesGPU:
+    def __init__(self, clauses_np, N):
+        self.N = N
+        self.M = len(clauses_np)
+        self.clauses = cp.array(clauses_np)
+        
+        # --- 1. Geometry Setup ---
+        # Node 0 is Ghost (+). Nodes 1..N are variables.
+        self.GHOST = 0
+        
+        # Extract literals (M, 3)
+        self.lits_idx = cp.abs(self.clauses)
+        self.lits_sign = cp.sign(self.clauses)
+        
+        # --- 2. Build Triangle Interactions (Internal) ---
+        # Edges: (0,1), (1,2), (2,0) relative to clause indices 0,1,2
+        # Sign Logic: Same Sign = AF (-1), Diff Sign = Ferro (+1)
+        # We store these as J_tri: (M, 3) corresponding to pairs (0,1), (1,2), (2,0)
+        
+        s = self.lits_sign # (M, 3)
+        # Pair (0,1)
+        j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
+        # Pair (1,2)
+        j12 = cp.where(s[:, 1] == s[:, 2], -1, 1)
+        # Pair (2,0)
+        j20 = cp.where(s[:, 2] == s[:, 0], -1, 1)
+        
+        self.J_tri = cp.stack([j01, j12, j20], axis=1).astype(cp.int8)
+        
+        # --- 3. Build Tetrahedron Interactions (to Ghost) ---
+        # J_tetra: (M, 3). Edge between lit k and Ghost.
+        # Lit > 0 (x) -> Match Ghost (+) -> Ferro (+1)
+        # Lit < 0 (not x) -> Mismatch Ghost (+) -> AF (-1)
+        self.J_tetra = s.astype(cp.int8)
+        
+        # Initialize Spins (0..N)
+        # 0 is fixed to 1. Others random.
+        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
+        self.sigma[0] = 1
+
+    def energy_check(self, omega):
+        # Computes global energy and verifies levels.
+        # Level 1 (SAT): 3*omega/2
+        # Level 2 (UNSAT): 5*omega/2
+        
+        # 1. Clause Satisfaction
+        # Lit satisfied if sigma[idx] == sign
+        spins = self.sigma[self.lits_idx]
+        is_lit_sat = (spins == self.lits_sign)
+        is_clause_sat = cp.any(is_lit_sat, axis=1)
+        
+        # Energy Calculation (Formal Hamiltonian)
+        # This is a conceptual check. In our model, we just count SAT/UNSAT.
+        # But let's verify the user's "levels".
+        # If SAT: Energy should be 1.5 * omega
+        # If UNSAT: Energy should be 2.5 * omega
+        
+        total_E = cp.sum(cp.where(is_clause_sat, 1.5 * omega, 2.5 * omega))
+        avg_E_sat = 1.5 * omega
+        avg_E_unsat = 2.5 * omega
+        
+        unsat_frac = 1.0 - cp.mean(is_clause_sat)
+        return total_E, unsat_frac
+
+    def step(self, omega):
+        # Performs one Swendsen-Wang step using Triangle + Tetra dynamics.
+        
+        num_clauses = self.M
+        
+        # --- A. Tetrahedron Dynamics (Freezing to Ghost) ---
+        # User Instruction: "Le tétraèdre n'est possiblement gelé que si *tous* les trois spins
+        # du triangle sont conforme à \\sigma_0. Alors avec probabilité 1-e^{-\\omega}, 
+        # il faut geler tout le tétraèdre."
+        
+        # Get spins for all literals in clauses
+        c_spins = self.sigma[self.lits_idx] # (M, 3)
+        
+        # Check literal satisfaction vs Ghost (+1)
+        # lit_is_sat[m, k] is True if literal k of clause m is consistent with Ghost
+        lit_is_sat = (c_spins == self.J_tetra)
+        
+        # Condition: ALL 3 spins must be conformant
+        tetra_fully_sat = cp.all(lit_is_sat, axis=1) # (M,)
+        
+        # Probability to freeze the WHOLE tetrahedron
+        p_tetra = 1.0 - cp.exp(-omega)
+        rand_tetra = cp.random.random(num_clauses, dtype=cp.float32)
+        
+        # Decision: Freeze if Fully Sat AND random < p
+        do_freeze_tetra = tetra_fully_sat & (rand_tetra < p_tetra) # (M,)
+        
+        # Broadcast decision to all 3 edges (M, 3)
+        # If do_freeze_tetra[m] is True, then freeze (m,0), (m,1), (m,2)
+        freeze_tetra = cp.stack([do_freeze_tetra]*3, axis=1)
+        
+        # --- B. Triangle Dynamics (Inherently Contradictory) ---
+        # Weight w = omega / 2
+        w = omega / 2.0
+        # Probabilities from PDF Table 3.1 (Right - Inherently Contradictory)
+        # p_freeze_1 = 0.5 * (1 - exp(-2w))
+        # High Energy State (3 unsat?): Freeze Empty set (Prob 1).
+        # Low Energy State (1 unsat): Freeze 1 satisfied edge (Prob p_freeze_1).
+        
+        # 1. Determine State of each triangle
+        # Edges 0:(0,1), 1:(1,2), 2:(2,0)
+        # Get spins
+        s0 = c_spins[:, 0]
+        s1 = c_spins[:, 1]
+        s2 = c_spins[:, 2]
+        
+        # Check satisfaction of internal edges
+        # Edge is sat if spin_i * spin_j * J == 1
+        # J stored in self.J_tri
+        sat0 = (s0 * s1 * self.J_tri[:, 0]) == 1
+        sat1 = (s1 * s2 * self.J_tri[:, 1]) == 1
+        sat2 = (s2 * s0 * self.J_tri[:, 2]) == 1
+        
+        sat_mask = cp.stack([sat0, sat1, sat2], axis=1) # (M, 3)
+        num_sat = cp.sum(sat_mask, axis=1)
+        
+        # In a frustrated triangle, max SAT edges is 2 (Low Energy), min is 0 (High Energy, if ferro) or 3 unsat?
+        # For -1, +1, +1 (AF, F, F):
+        # If +++: -1(U), +1(S), +1(S). 2 SAT. Low Energy.
+        # If +--: +1(S), +1(S), -1(U). 2 SAT. Low Energy.
+        # Check "High Energy": s1=1, s2=1, s3=-1. J=(-1, 1, 1).
+        # (1,1,J=-1)->U. (1,-1,J=1)->U. (-1,1,J=1)->U. 0 SAT. High Energy.
+        
+        is_low_energy = (num_sat == 2)
+        # is_high_energy = (num_sat == 0) 
+        
+        # Dynamics:
+        # If High Energy (0 sat): Freeze Nothing (Empty).
+        # If Low Energy (2 sat): Freeze exactly ONE of the 2 satisfied edges.
+        # Prob to freeze = 0.5 * (1 - exp(-2w))
+        # Wait, PDF says "freeze exactly one... with probability 1/2(1-e^-2w)".
+        # Does it mean we might freeze NOTHING in Low Energy? Yes. 
+        # Total prob to freeze SOMETHING is (1 - e^-2w). Split between the 2 edges.
+        
+        p_freeze_any = 1.0 - cp.exp(-2.0 * w)
+        # But we must pick WHICH one. Uniformly among the 2.
+        
+        rand_tri = cp.random.random(num_clauses, dtype=cp.float32)
+        
+        # Output mask for triangle edges (M, 3)
+        freeze_tri = cp.zeros((num_clauses, 3), dtype=bool)
+        
+        # Logic for Low Energy:
+        # If rand < p_freeze_any: we freeze ONE edge.
+        # Which one? The first satisfied or second satisfied?
+        # We need to select one of the TRUE values in sat_mask randomly.
+        
+        # Create a random selector for the 2 edges
+        # We can multiply sat_mask by random numbers and pick argmax
+        selector = cp.random.random((num_clauses, 3), dtype=cp.float32)
+        selector = selector * sat_mask # Zero out unsat edges
+        target_edge = cp.argmax(selector, axis=1) # Index of edge to freeze
+        
+        # Apply freeze
+        # Mask: Low Energy AND (rand < p_freeze_any)
+        do_freeze = is_low_energy & (rand_tri < p_freeze_any)
+        
+        # Set the bit
+        # We use fancy indexing. indices (0..M-1), target_edge
+        row_idxs = cp.arange(num_clauses)[do_freeze]
+        col_idxs = target_edge[do_freeze]
+        freeze_tri[row_idxs, col_idxs] = True
+        
+        # --- C. Graph Construction ---
+        # We need to build the adjacency matrix for Connected Components.
+        # Nodes: 0..N.
+        
+        # 1. Tetra Edges (Ghost-Variable)
+        # freeze_tetra is (M, 3). 
+        # Indices: (Ghost, lits_idx[m, 0]), etc.
+        t_rows, t_cols = cp.where(freeze_tetra)
+        # t_rows is clause index, t_cols is 0,1,2
+        # Map t_cols to variable index
+        var_indices = self.lits_idx[t_rows, t_cols]
+        
+        src_tetra = cp.zeros_like(var_indices) # All 0 (Ghost)
+        dst_tetra = var_indices
+        
+        # 2. Triangle Edges (Var-Var)
+        # freeze_tri is (M, 3). Pairs: (0,1), (1,2), (2,0)
+        tr_rows, tr_cols = cp.where(freeze_tri)
+        
+        # Map to variables
+        # if tr_cols == 0 -> edge between lit 0 and lit 1
+        # if tr_cols == 1 -> edge between lit 1 and lit 2
+        # if tr_cols == 2 -> edge between lit 2 and lit 0
+        
+        idx0 = self.lits_idx[tr_rows, 0]
+        idx1 = self.lits_idx[tr_rows, 1]
+        idx2 = self.lits_idx[tr_rows, 2]
+        
+        src_tri = cp.zeros_like(tr_rows)
+        dst_tri = cp.zeros_like(tr_rows)
+        
+        # Vectorized assignment
+        mask0 = (tr_cols == 0)
+        src_tri[mask0] = idx0[mask0]
+        dst_tri[mask0] = idx1[mask0]
+        
+        mask1 = (tr_cols == 1)
+        src_tri[mask1] = idx1[mask1]
+        dst_tri[mask1] = idx2[mask1]
+        
+        mask2 = (tr_cols == 2)
+        src_tri[mask2] = idx2[mask2]
+        dst_tri[mask2] = idx0[mask2]
+        
+        # Combine
+        all_src = cp.concatenate([src_tetra, src_tri])
+        all_dst = cp.concatenate([dst_tetra, dst_tri])
+        
+        # --- D. Cluster Flip ---
+        if len(all_src) > 0:
+            # Build Graph
+            # Fix: CuPy sparse/graph utils often require numeric types (float/int), not bool
+            data = cp.ones(len(all_src), dtype=cp.float32)
+            adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
             
-            # Fallback for empty edges (Global random flip)
-            self.spins = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N + 1)
+            # Component Labeling
+            n_comps, labels = cpx_graph.connected_components(adj, directed=False)
+            
+            # --- Percolation Analysis (New) ---
+            # Calculate sizes of all components
+            # labels is an array of component IDs for each node
+            # We use bincount to count nodes per label
+            comp_sizes = cp.bincount(labels)
+            
+            # Sort descending to get largest
+            sorted_sizes = cp.sort(comp_sizes)[::-1]
+            
+            # Largest component (C1)
+            c1_size = sorted_sizes[0]
+            
+            # Second largest (C2) - handle case where only 1 component exists
+            if n_comps > 1:
+                c2_size = sorted_sizes[1]
+            else:
+                c2_size = 0.0
+                
+            c1_frac = c1_size / float(self.N + 1)
+            c2_frac = c2_size / float(self.N + 1)
+            
+            # Flip Logic
+            # 1. Identify Ghost Cluster
+            ghost_label = labels[0]
+            
+            # 2. Random Flips for all clusters
+            cluster_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_comps)
+            
+            # 3. Force Ghost Cluster to +1 (Keep Ghost Fixed)
+            # Standard SW: Flip clusters randomly.
+            # If the cluster containing Ghost (0) flips to -1, we flip EVERYTHING to restore Gauge.
+            # (Global Spin Flip symmetry)
+            
+            # Apply cluster flips first
+            flip_vector = cluster_flips[labels]
+            self.sigma *= flip_vector
+            
+            # Check Ghost
+            if self.sigma[self.GHOST] == -1:
+                self.sigma *= -1 # Flip everything back so Ghost is +1
+        else:
+            # No edges frozen. All free clusters (except 0).
+            # 1 Giant component? No, N components of size 1.
+            # Wait, if no edges, every node is its own component.
+            # So C1 = 1/(N+1), C2 = 1/(N+1)
+            c1_frac = 1.0 / (self.N + 1)
+            c2_frac = 1.0 / (self.N + 1)
+            
+            # Flip everyone randomly except 0.
+            flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N+1)
+            self.sigma *= flips
+            if self.sigma[self.GHOST] == -1:
+                self.sigma *= -1
+            
+        return self.energy_check(omega)[1], c1_frac, c2_frac # Return unsat, c1, c2
+"""
+add_code(solver_code)
 
-    def energy(self):
-        """Global 3-SAT Energy (Fraction Unsatisfied Clauses)."""
-        # (M, 3)
-        indices = cp.array(self.raw_clauses - 1) # 0-based
-        signs = cp.array(np.sign(self.raw_clauses), dtype=cp.int8)
-        indices = cp.abs(indices)
-        
-        current_spins = self.spins[indices]
-        is_sat = (current_spins == signs)
-        clause_sat = cp.any(is_sat, axis=1)
-        
-        return 1.0 - cp.mean(clause_sat)'''
-b.cells.append(nbf.v4.new_code_cell(code_solver))
-
-# Cell 5: Baseline
-code_baseline = r"""# @title 4. Baseline: `MetropolisGPU`
-# A simple parallel Metropolis sampler for comparison.
+# 5. Baseline Code
+baseline_code = """# @title 4. Baseline: `MetropolisGPU`
 
 class MetropolisGPU:
-    def __init__(self, clauses_np, N, beta=2.0):
+    def __init__(self, clauses_np, N):
+        print(f"Initializing MetropolisGPU with N={N}...")
         self.N = N
-        self.indices = cp.array(np.abs(clauses_np) - 1, dtype=cp.int32)
-        self.signs = cp.array(np.sign(clauses_np), dtype=cp.int8)
-        self.spins = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N)
-        self.beta = beta
-        
-    def step(self):
-        # Propose random flips (vectorized batch flip often bad for dense, 
-        # but for sparse SAT, we can try flipping a fraction or just 1. 
-        # For fairness, let's flip N variables in parallel with acceptance).
-        
-        # 1. Compute current energy (unsat count) per clause
-        # This is expensive to do fully incrementally on python level,
-        # so we do a naive full recalculation or a partial optimized one.
-        # For speed in this demo, we'll just do a 1% spin flip batch.
-        
-        n_flip = max(1, int(self.N * 0.01))
-        flip_indices = cp.random.randint(0, self.N, size=n_flip)
-        
-        # Calc global energy before
-        e_old = self.get_energy_count()
-        
-        # Flip
-        self.spins[flip_indices] *= -1
-        
-        # Calc global energy after
-        e_new = self.get_energy_count()
-        
-        # Metropolis acceptance
-        delta_E = e_new - e_old
-        if delta_E > 0:
-            p = cp.exp(-self.beta * delta_E)
-            if cp.random.random() > p:
-                # Reject: Flip back
-                self.spins[flip_indices] *= -1
-
-    def get_energy_count(self):
-        current = self.spins[self.indices]
-        is_sat = (current == self.signs)
-        clause_sat = cp.any(is_sat, axis=1)
-        return cp.sum(~clause_sat)
+        # Convert to CuPy array first (Explicit Fix)
+        clauses_cp = cp.array(clauses_np, dtype=cp.int32)
+        self.lits_idx = cp.abs(clauses_cp)
+        self.lits_sign = cp.sign(clauses_cp).astype(cp.int8)
+        # Use a separate spin array
+        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
+        self.sigma[0] = 1
 
     def energy(self):
-        return self.get_energy_count() / len(self.indices)"""
-b.cells.append(nbf.v4.new_code_cell(code_baseline))
+        spins = self.sigma[self.lits_idx]
+        is_sat = (spins == self.lits_sign)
+        clause_sat = cp.any(is_sat, axis=1)
+        return 1.0 - cp.mean(clause_sat)
 
-# Cell 6: Execution
-code_exec = """# @title 5. Execution & Benchmarking
-
-# Configuration
-SOURCE = "SATLIB (uf250)" # @param ["Random", "SATLIB (uf250)", "Custom URL"]
-CUSTOM_URL = "" # @param {type:"string"}
-
-# Random Params
-N = 2000          # Number of variables (for Random)
-alpha = 4.2       # Clause density (for Random)
-
-# Solver Params
-steps = 500       # Simulation steps
-omega = 3.5       # Interaction strength (Tetra)
-beta_base = 4.0   # Inv Temp (Metropolis)
-compare_baseline = True # @param {type:"boolean"} 
-
-# Load Data
-if SOURCE == "Random":
-    print(f"Generating Random 3-SAT: N={N}, M={int(alpha*N)}...")
-    clauses, real_N = generate_random_3sat(N, alpha, seed=42)
-elif SOURCE == "SATLIB (uf250)":
-    # Example hard instance from SATLIB
-    url = "https://www.cs.ubc.ca/~hoos/SATLIB/Benchmarks/SAT/RND3SAT/uf250-1065.tar.gz"
-    print(f"Fetching {url}...")
-    clauses, real_N = download_and_parse_instance(url)
-else:
-    if not CUSTOM_URL:
-        print("Error: Please provide a Custom URL.")
-        clauses, real_N = np.array([]), 0
-    else:
-        clauses, real_N = download_and_parse_instance(CUSTOM_URL)
-
-if len(clauses) == 0:
-    print("No valid clauses found. Exiting.")
-else:
-    print(f"Loaded Instance: N={real_N}, M={len(clauses)}")
-
-    # --- Run Tetra Dynamics ---
-    print("Initializing TetraDynamicsGPU...")
-    tetra_solver = TetraDynamicsGPU(clauses, real_N, omega=omega)
-
-    tetra_energies = []
-    start_t = time.time()
-    for i in range(steps):
-        tetra_solver.step()
-        if i % 10 == 0:
-            e = tetra_solver.energy().item()
-            tetra_energies.append(e)
-            # print(f"Step {i}: E={e:.4f}")
-    end_t = time.time()
-    print(f"Tetra Dynamics Time: {end_t - start_t:.2f}s")
-
-    # --- Run Baseline (Optional) ---
-    metro_energies = []
-    if compare_baseline:
-        print("Initializing MetropolisGPU...")
-        metro_solver = MetropolisGPU(clauses, real_N, beta=beta_base)
+    def step(self, beta):
+        # Parallel Metropolis (Checkerboard-like or Batch)
+        # We pick N/10 random indices to flip
+        n_flip = max(1, self.N // 100)
+        idx = cp.random.randint(1, self.N + 1, size=n_flip)
         
-        start_t = time.time()
-        for i in range(steps):
-            metro_solver.step()
-            if i % 10 == 0:
-                e = metro_solver.energy().item()
-                metro_energies.append(e)
-        end_t = time.time()
-        print(f"Metropolis Time: {end_t - start_t:.2f}s")
+        e_old = self.energy()
+        # Flip
+        self.sigma[idx] *= -1
+        e_new = self.energy()
+        
+        delta = e_new - e_old
+        # Since energy is fraction unsat, we need to scale by M for actual Hamiltonian difference
+        # H ~ M * unsat.
+        # P = exp(-beta * M * delta)
+        # Note: User said beta proportional to omega. 
+        # If omega is O(1), and energy is O(1), beta should be O(M) or similar?
+        # Let's assume passed beta is the effective coupling.
+        
+        if delta > 0:
+            p = cp.exp(-beta * delta * 100.0) # Scaling factor for sensitivity
+            if cp.random.random() > p:
+                self.sigma[idx] *= -1 # Reject"""
+add_code(baseline_code)
 
-    # --- Plotting ---
-    x_axis = np.arange(0, steps, 10)
-    plt.figure()
-    plt.plot(x_axis, tetra_energies, label='Tetra Cluster Dynamics (Ours)', color='cyan', linewidth=2)
-    if compare_baseline:
-        plt.plot(x_axis, metro_energies, label='Standard Metropolis', color='orange', alpha=0.7)
+# 6. Main Loop Code
+main_code = r"""# @title 5. Main Simulation Loop (Annealing)
 
-    plt.xlabel('MC Steps')
-    plt.ylabel('Fraction Unsatisfied (Energy)')
-    plt.title(rf'3-SAT Optimization: N={real_N}, M={len(clauses)}')
-    plt.legend()
-    plt.grid(True, alpha=0.2)
-    plt.show()"""
-b.cells.append(nbf.v4.new_code_cell(code_exec))
+# Config
+N = 500
+alpha = 4.25 # Hard region
+clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 
-with open('sw3sat_colab.ipynb', 'w') as f:
-    nbf.write(b, f)
+print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
+
+solver = SwendsenWangTrianglesGPU(clauses_np, N)
+metro = MetropolisGPU(clauses_np, N)
+
+# Schedule
+steps = 200
+omega_start = 0.5
+omega_end = 6.0
+omega_schedule = np.linspace(omega_start, omega_end, steps)
+
+history_sw = []
+history_c1 = []
+history_c2 = []
+history_mh = []
+
+t0 = time.time()
+print("Starting Annealing...")
+
+for i, omega in enumerate(omega_schedule):
+    # 1. Swendsen-Wang Step
+    unsat_sw, c1, c2 = solver.step(omega)
+    
+    # Store SW Energy
+    if hasattr(unsat_sw, 'get'):
+        history_sw.append(float(unsat_sw.get()))
+    else:
+        history_sw.append(float(unsat_sw))
+        
+    # Store Cluster Sizes
+    if hasattr(c1, 'get'):
+        history_c1.append(float(c1.get()))
+    else:
+        history_c1.append(float(c1))
+        
+    if hasattr(c2, 'get'):
+        history_c2.append(float(c2.get()))
+    else:
+        history_c2.append(float(c2))
+    
+    # 2. Metropolis Step
+    # Heuristic scaling for beta to match omega's constraining power
+    beta = omega * 5.0 
+    # Run multiple sub-steps for fair comparison (SW is global)
+    for _ in range(5):
+        metro.step(beta)
+    
+    e_mh = metro.energy()
+    if hasattr(e_mh, 'get'):
+        history_mh.append(float(e_mh.get()))
+    else:
+        history_mh.append(float(e_mh))
+    
+    if i % 20 == 0:
+        print(f"Step {i:3d} | Omega {omega:.2f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.2f}) | MH Unsat: {history_mh[-1]:.4f}")
+
+dt = time.time() - t0
+print(f"Done in {dt:.2f}s")
+
+# Plot
+# Ensure inputs are on CPU (NumPy) before plotting
+omega_cpu = omega_schedule.get() if hasattr(omega_schedule, 'get') else omega_schedule
+sw_cpu = np.array(history_sw)
+c1_cpu = np.array(history_c1)
+c2_cpu = np.array(history_c2)
+mh_cpu = np.array(history_mh)
+
+print(f"Plotting types: Omega={type(omega_cpu)}, SW={type(sw_cpu)}")
+
+fig, ax1 = plt.subplots(figsize=(12, 7))
+
+# Left Axis: Energy
+color_sw = 'cyan'
+color_mh = 'orange'
+ax1.set_xlabel(r'Coupling $\omega$ (Inverse Temp)')
+ax1.set_ylabel('Fraction Unsatisfied Clauses', color='white')
+l1, = ax1.plot(omega_cpu, sw_cpu, label='SW Energy', color=color_sw, linewidth=2)
+l2, = ax1.plot(omega_cpu, mh_cpu, label='MH Energy', color=color_mh, alpha=0.6)
+ax1.tick_params(axis='y', labelcolor='white')
+ax1.grid(True, alpha=0.2)
+
+# Right Axis: Cluster Sizes
+ax2 = ax1.twinx()
+color_c1 = 'magenta'
+color_c2 = 'lime'
+ax2.set_ylabel('Cluster Size Fraction (Percolation)', color='white')
+l3, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (C1)', color=color_c1, linestyle='--', linewidth=1.5)
+l4, = ax2.plot(omega_cpu, c2_cpu, label='2nd Largest (C2)', color=color_c2, linestyle=':', linewidth=1.5)
+ax2.tick_params(axis='y', labelcolor='white')
+
+# Combine legends
+lines = [l1, l2, l3, l4]
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc='center right')
+
+plt.title(rf'3-SAT Annealing: N={N}, $\alpha$={alpha} | Topo-Percolation')
+plt.show()"""
+add_code(main_code)
+
+with open("Swendsen-Wang_3SAT_Colab.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook, f, indent=1)
+
+print("Notebook generated successfully.")
