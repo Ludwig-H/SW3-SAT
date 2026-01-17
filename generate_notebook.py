@@ -455,12 +455,15 @@ class StochasticSwendsenWangGPU:
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1 
         else:
+            c1_frac = 1.0 / (self.N + 1)
+            c2_frac = 1.0 / (self.N + 1)
+            
             flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N+1)
             self.sigma *= flips
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1
             
-        return self.energy_check(omega)
+        return self.energy_check(omega), c1_frac, c2_frac
 """
 add_code(solver_code)
 
@@ -510,6 +513,8 @@ steps = 200
 omega_schedule = np.linspace(0.5, 6.0, steps)
 
 history_sw = []
+history_c1 = []
+history_c2 = []
 history_mh = []
 
 t0 = time.time()
@@ -517,10 +522,16 @@ print("Starting Annealing...")
 
 for i, omega in enumerate(omega_schedule):
     # Stochastic SW Step
-    unsat_sw = solver.step(omega)
+    unsat_sw, c1, c2 = solver.step(omega)
     
     if hasattr(unsat_sw, 'get'): history_sw.append(float(unsat_sw.get()))
     else: history_sw.append(float(unsat_sw))
+    
+    if hasattr(c1, 'get'): history_c1.append(float(c1.get()))
+    else: history_c1.append(float(c1))
+    
+    if hasattr(c2, 'get'): history_c2.append(float(c2.get()))
+    else: history_c2.append(float(c2))
     
     # Metropolis Step
     beta = omega * 5.0 
@@ -531,7 +542,7 @@ for i, omega in enumerate(omega_schedule):
     else: history_mh.append(float(e_mh))
     
     if i % 20 == 0:
-        print(f"Step {i:3d} | Omega {omega:.2f} | SW Unsat: {unsat_sw:.4f} | MH Unsat: {history_mh[-1]:.4f}")
+        print(f"Step {i:3d} | Omega {omega:.2f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.2f}) | MH Unsat: {history_mh[-1]:.4f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
@@ -539,16 +550,34 @@ print(f"Done in {dt:.2f}s")
 # Plot
 omega_cpu = omega_schedule
 sw_cpu = np.array(history_sw)
+c1_cpu = np.array(history_c1)
+c2_cpu = np.array(history_c2)
 mh_cpu = np.array(history_mh)
 
-plt.figure(figsize=(10, 6))
-plt.plot(omega_cpu, sw_cpu, label='Stochastic SW', color='cyan')
-plt.plot(omega_cpu, mh_cpu, label='Metropolis', color='orange', alpha=0.6)
-plt.xlabel(r'Coupling $\omega$')
-plt.ylabel('Fraction Unsatisfied')
-plt.title(f'Stochastic SW vs MH (N={N}, Alpha={alpha})')
-plt.legend()
-plt.grid(True, alpha=0.2)
+plt.figure(figsize=(12, 7))
+ax1 = plt.gca()
+
+# Energy Axis
+l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW Energy', color='cyan', linewidth=2)
+l2, = ax1.plot(omega_cpu, mh_cpu, label='Metropolis Energy', color='orange', alpha=0.6)
+ax1.set_xlabel(r'Coupling $\omega$')
+ax1.set_ylabel('Fraction Unsatisfied', color='white')
+ax1.tick_params(axis='y', labelcolor='white')
+ax1.grid(True, alpha=0.2)
+
+# Cluster Axis
+ax2 = ax1.twinx()
+l3, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (C1)', color='magenta', linestyle='--', linewidth=1.5)
+l4, = ax2.plot(omega_cpu, c2_cpu, label='2nd Largest (C2)', color='lime', linestyle=':', linewidth=1.5)
+ax2.set_ylabel('Cluster Size Fraction', color='white')
+ax2.tick_params(axis='y', labelcolor='white')
+
+# Legend
+lines = [l1, l2, l3, l4]
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc='center right')
+
+plt.title(f'Stochastic SW vs MH (N={N}, Alpha={alpha}) | Percolation')
 plt.show()
 """
 add_code(main_code)
