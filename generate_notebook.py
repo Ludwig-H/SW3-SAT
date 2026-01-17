@@ -57,7 +57,7 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
 1.  **Stochastic Swendsen-Wang (Ours)**:
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
-    *   **New**: Uses Cluster-Logistic flips with `beta_scale` to control determinism.
+    *   **New**: Uses **Exact Hamiltonian Cluster Updates** (Exact Energy Delta) for decision.
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
@@ -119,7 +119,7 @@ class StochasticSwendsenWangGPU:
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
         self.GHOST = 0
-        self.beta_scale = beta_scale # High value (10+) = Greedy, Low value (1) = HeatBath
+        self.beta_scale = beta_scale
         
         # Literals
         self.lits_idx = cp.abs(self.clauses)
@@ -180,12 +180,15 @@ class StochasticSwendsenWangGPU:
         src_nodes = []
         dst_nodes = []
         
+        # --- Tetra & Triangle Logic (Swendsen-Wang Edges) ---
+        # ... (Same as before, reusing logic for building graph) ...
+        # (Simplified for brevity in this prompt logic, keeping previous blocks)
+        
         # --- A. Tetrahedron Logic (Fully SAT) ---
         mask_A = is_fully_sat & (rand_vals < P)
         if cp.any(mask_A):
             idx_A = cp.where(mask_A)[0]
             n_marked_A = num_marked[idx_A]
-            
             # Case A1: 3 Marked
             mask_A1 = (n_marked_A == 3)
             if cp.any(mask_A1):
@@ -194,7 +197,6 @@ class StochasticSwendsenWangGPU:
                 targets = self.lits_idx[idx_A1, r_sel]
                 src_nodes.append(cp.zeros_like(targets))
                 dst_nodes.append(targets)
-            
             # Case A2: < 3 Marked
             mask_A2 = (n_marked_A < 3)
             if cp.any(mask_A2):
@@ -208,32 +210,28 @@ class StochasticSwendsenWangGPU:
 
         # --- B. Triangle Logic (Low Energy & NOT Fully Sat) ---
         mask_B = is_low_energy & (~is_fully_sat) & (rand_vals < P)
-        
         if cp.any(mask_B):
             idx_B = cp.where(mask_B)[0]
             n_marked_B = num_marked[idx_B]
             
-            # Case B3: 3 Marked
+            # Case B3
             mask_B3 = (n_marked_B == 3)
             if cp.any(mask_B3):
                 idx_B3 = idx_B[mask_B3]
                 sat_lits_B3 = lit_is_sat[idx_B3]
-                r_sel = cp.random.random(sat_lits_B3.shape, dtype=cp.float32)
-                r_sel = r_sel * sat_lits_B3
+                r_sel = cp.random.random(sat_lits_B3.shape, dtype=cp.float32) * sat_lits_B3
                 chosen_col = cp.argmax(r_sel, axis=1)
                 targets = self.lits_idx[idx_B3, chosen_col]
                 src_nodes.append(cp.zeros_like(targets))
                 dst_nodes.append(targets)
-
-            # Case B2: 2 Marked
+            # Case B2
             mask_B2 = (n_marked_B == 2)
             if cp.any(mask_B2):
                 idx_B2 = idx_B[mask_B2]
                 unmarked_col = cp.argmin(lit_marked[idx_B2], axis=1)
                 row_ids = cp.arange(len(idx_B2))
                 is_unmarked_sat = lit_is_sat[idx_B2, unmarked_col]
-                
-                # B2.1: Unmarked is SAT
+                # B2.1
                 if cp.any(is_unmarked_sat):
                     sub_idx = row_ids[is_unmarked_sat]
                     real_idx = idx_B2[sub_idx]
@@ -241,56 +239,48 @@ class StochasticSwendsenWangGPU:
                     targets = self.lits_idx[real_idx, cols]
                     src_nodes.append(cp.zeros_like(targets))
                     dst_nodes.append(targets)
-                    
-                # B2.2: Unmarked is UNSAT -> Freeze SAT edge (not connecting marked)
+                # B2.2
                 is_unmarked_unsat = ~is_unmarked_sat
                 if cp.any(is_unmarked_unsat):
                     sub_idx = row_ids[is_unmarked_unsat]
                     real_idx = idx_B2[sub_idx]
                     forbidden_edge = unmarked_col[sub_idx]
-                    
                     c_sat_mask = sat_mask[real_idx]
                     temp_mask = c_sat_mask.copy()
                     temp_mask[cp.arange(len(real_idx)), forbidden_edge] = False
                     target_edge = cp.argmax(temp_mask, axis=1)
-                    
                     lits = self.lits_idx[real_idx]
                     l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
                     s_e = cp.where(target_edge==0, l0, cp.where(target_edge==1, l1, l2))
                     d_e = cp.where(target_edge==0, l1, cp.where(target_edge==1, l2, l0))
                     src_nodes.append(s_e)
                     dst_nodes.append(d_e)
-
-            # Case B1: 1 Marked
+            # Case B1
             mask_B1 = (n_marked_B == 1)
             if cp.any(mask_B1):
                 idx_B1 = idx_B[mask_B1]
                 marked_col = cp.argmax(lit_marked[idx_B1], axis=1)
                 row_ids = cp.arange(len(idx_B1))
                 is_opp_sat = sat_mask[idx_B1, marked_col]
-                
-                # B1.1: Opp Edge SAT
+                # B1.1
                 if cp.any(is_opp_sat):
                     sub_idx = row_ids[is_opp_sat]
                     real_idx = idx_B1[sub_idx]
                     target_edge = marked_col[sub_idx]
-                    
                     lits = self.lits_idx[real_idx]
                     l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
                     s_e = cp.where(target_edge==0, l0, cp.where(target_edge==1, l1, l2))
                     d_e = cp.where(target_edge==0, l1, cp.where(target_edge==1, l2, l0))
                     src_nodes.append(s_e)
                     dst_nodes.append(d_e)
-                
-                # B1.2: Opp Edge UNSAT
+                # B1.2
                 is_opp_unsat = ~is_opp_sat
                 if cp.any(is_opp_unsat):
                     sub_idx = row_ids[is_opp_unsat]
                     real_idx = idx_B1[sub_idx]
                     m_col = marked_col[sub_idx]
                     is_marked_lit_sat = lit_is_sat[real_idx, m_col]
-                    
-                    # B1.2.a: Marked Lit UNSAT
+                    # B1.2.a
                     mask_a = (~is_marked_lit_sat)
                     if cp.any(mask_a):
                         idx_a = real_idx[mask_a]
@@ -301,8 +291,7 @@ class StochasticSwendsenWangGPU:
                         targets = self.lits_idx[idx_a, target_col]
                         src_nodes.append(cp.zeros_like(targets))
                         dst_nodes.append(targets)
-                        
-                    # B1.2.b: Marked Lit SAT
+                    # B1.2.b
                     mask_b = (is_marked_lit_sat)
                     if cp.any(mask_b):
                         idx_b = real_idx[mask_b]
@@ -310,22 +299,18 @@ class StochasticSwendsenWangGPU:
                         targets = self.lits_idx[idx_b, mc]
                         src_nodes.append(cp.zeros_like(targets))
                         dst_nodes.append(targets)
-
-            # Case B0: 0 Marked
+            # Case B0
             mask_B0 = (n_marked_B == 0)
             if cp.any(mask_B0):
                 idx_B0 = idx_B[mask_B0]
                 sub_sat = sat_mask[idx_B0]
-                r_vals = rand_vals[mask_B][mask_B0]
-                pick_first = (r_vals < (P / 2.0))
-                
+                r_vals_B = rand_vals[mask_B][mask_B0]
+                pick_first = (r_vals_B < (P / 2.0))
                 idx_1st = cp.argmax(sub_sat, axis=1)
                 temp = sub_sat.copy()
                 temp[cp.arange(len(idx_B0)), idx_1st] = False
                 idx_2nd = cp.argmax(temp, axis=1)
-                
                 chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
-                
                 lits = self.lits_idx[idx_B0]
                 l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
                 s_e = cp.where(chosen_edge_idx==0, l0, cp.where(chosen_edge_idx==1, l1, l2))
@@ -353,53 +338,111 @@ class StochasticSwendsenWangGPU:
             c1_frac = c1_size / float(self.N + 1)
             c2_frac = c2_size / float(self.N + 1)
             
-            # --- CLUSTER LOGISTIC LOGIC (Sigmoid Vote) ---
+            # --- EXACT HAMILTONIAN CLUSTER UPDATE ---
             
-            # 1. Calculate local "vote" for each variable
-            # Vote = (Sat if flip) - (Sat now)
-            vote_updates = cp.zeros(self.N + 1, dtype=cp.int32)
+            # We want to compute Delta_E = (New Unsat) - (Old Unsat) for each cluster if flipped.
+            # But "Unsat" counts are usually integers. Here we define Energy = Unsat Fraction?
+            # Let's work with raw Clause Counts (Integers).
+            # Delta_Score > 0 means Energy DECREASES (Satisfied clauses INCREASE).
+            # So Score = (New Sat) - (Old Sat).
             
-            # UNSAT Contribution (+1)
-            if cp.any(is_unsat):
-                unsat_v = self.lits_idx[is_unsat].flatten()
-                cp.add.at(vote_updates, unsat_v, 1)
+            cluster_votes = cp.zeros(n_comps, dtype=cp.int32)
+            
+            # Helper to get cluster IDs for all literals in clauses
+            # lits_idx shape (M, 3)
+            lit_clusters = labels[self.lits_idx] # (M, 3)
+            
+            # Current Sat Status of all clauses
+            # lit_is_sat shape (M, 3)
+            # is_clause_sat_curr shape (M)
+            is_clause_sat_curr = cp.any(lit_is_sat, axis=1)
+            
+            # We iterate over the 3 columns (literals) to see "What if cluster C flips?"
+            # A clause might have literals in clusters C1, C2, C3.
+            # We only consider flipping ONE cluster at a time.
+            # So for cluster C1, we check clauses where it appears.
+            
+            # Since we can't loop over clusters, we loop over columns (0, 1, 2)
+            # For each column, we assume THAT column's cluster is flipping.
+            
+            processed_pairs = cp.zeros((self.M, 3), dtype=bool) # To track uniqueness if needed?
+            # Actually, simpler:
+            # For a clause, get unique clusters involved.
+            # E.g. Clusters [10, 10, 5]. Unique: [10, 5].
+            # Compute Delta for 10, Delta for 5. Add to global accumulator.
+            
+            # Vectorized approach:
+            # 1. Expand to (M, 3)
+            # 2. For each pos (i, k), let C = lit_clusters[i, k].
+            # 3. Simulate flip of C:
+            #    - Lits in C change SAT status.
+            #    - Lits NOT in C keep SAT status.
+            #    - Re-evaluate clause SAT.
+            #    - Compute Delta.
+            # 4. Handle duplicates: If col 1 has same cluster as col 0, don't double count.
+            
+            for col in range(3):
+                target_clusters = lit_clusters[:, col]
                 
-            # SAT-1 Contribution (Critical variables) (-1)
-            is_critical = (num_lit_sat == 1)
-            if cp.any(is_critical):
-                crit_idx = cp.where(is_critical)[0]
-                crit_col = cp.argmax(lit_is_sat[crit_idx], axis=1)
-                crit_vars = self.lits_idx[crit_idx, crit_col]
-                cp.add.at(vote_updates, crit_vars, -1)
+                # Check for duplicates with previous cols to avoid double counting for the same clause
+                is_duplicate = cp.zeros(self.M, dtype=bool)
+                for prev_col in range(col):
+                    is_duplicate |= (lit_clusters[:, prev_col] == target_clusters)
                 
-            # 2. Aggregate votes per cluster
-            cluster_votes = cp.bincount(labels, weights=vote_updates).astype(cp.int32)
-            
-            # 3. Decision (Logistic Soft-Decision)
-            # P(Flip) = sigmoid(vote * omega * beta_scale)
-            # beta_scale increases determinism (sharpness)
-            
+                # We only compute delta for clauses where this cluster is "new" to our calc
+                mask_process = ~is_duplicate
+                
+                if not cp.any(mask_process):
+                    continue
+                    
+                # Identify which literals in the clause belong to the SAME cluster 'target_clusters'
+                # (Because if C flips, ALL literals of C in this clause flip)
+                mask_in_cluster = (lit_clusters == target_clusters[:, None]) # (M, 3)
+                
+                # New status for these literals: NOT their current status
+                # (Since they flip sign, and clause signs are fixed, 'is_sat' inverts)
+                # Wait: lit_is_sat depends on (sigma * sign). 
+                # If sigma flips, sigma' = -sigma.
+                # New sat = (-sigma * sign) > 0  => -(sigma*sign) > 0 => (sigma*sign) < 0.
+                # So yes, is_sat inverts.
+                
+                new_lit_sat = lit_is_sat.copy()
+                
+                # Logic: Where mask_in_cluster is True, invert the boolean
+                # We only care about rows where mask_process is True, but doing all is safe/fast.
+                new_lit_sat[mask_in_cluster] = ~new_lit_sat[mask_in_cluster]
+                
+                # Re-eval clause
+                is_clause_sat_new = cp.any(new_lit_sat, axis=1)
+                
+                # Delta Score (+1 if becomes SAT, -1 if becomes UNSAT)
+                # Cast to int: True=1, False=0
+                delta = is_clause_sat_new.astype(cp.int32) - is_clause_sat_curr.astype(cp.int32)
+                
+                # Accumulate only for valid rows
+                valid_indices = cp.where(mask_process)[0]
+                valid_clusters = target_clusters[valid_indices]
+                valid_deltas = delta[valid_indices]
+                
+                # Add at
+                cp.add.at(cluster_votes, valid_clusters, valid_deltas)
+
+            # 3. Decision (Logistic)
             scores = cluster_votes.astype(cp.float32) * omega * self.beta_scale
-            
             probs = 1.0 / (1.0 + cp.exp(-scores))
             
-            # Random draw for each cluster
             r_vals = cp.random.random(n_comps, dtype=cp.float32)
-            
-            # -1 = Flip (if random < prob), 1 = Stay
             do_flip = cp.where(r_vals < probs, -1, 1).astype(cp.int8)
             
             # 4. Apply
             flip_vector = do_flip[labels]
             self.sigma *= flip_vector
             
-            # Ghost Invariant
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1 
         else:
             c1_frac = 1.0 / (self.N + 1)
             c2_frac = 1.0 / (self.N + 1)
-            
             flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N+1)
             self.sigma *= flips
             if self.sigma[self.GHOST] == -1:
