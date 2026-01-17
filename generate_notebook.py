@@ -437,6 +437,10 @@ class StochasticSwendsenWangGPU:
                 dst_nodes.append(d_e)
 
         # --- 4. Cluster & Flip ---
+        # Initialize percolation metrics to avoid UnboundLocalError
+        c1_frac = 0.0
+        c2_frac = 0.0
+
         if len(src_nodes) > 0:
             all_src = cp.concatenate(src_nodes)
             all_dst = cp.concatenate(dst_nodes)
