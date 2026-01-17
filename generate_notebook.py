@@ -625,6 +625,7 @@ omega_schedule = np.linspace(0.25, 2.0, steps)
 
 history_sw = []
 history_c1 = []
+history_c2 = []
 history_ws = []
 
 t0 = time.time()
@@ -639,6 +640,9 @@ for i, omega in enumerate(omega_schedule):
     
     if hasattr(c1, 'get'): history_c1.append(float(c1.get()))
     else: history_c1.append(float(c1))
+    
+    if hasattr(c2, 'get'): history_c2.append(float(c2.get()))
+    else: history_c2.append(float(c2))
     
     # WalkSAT Steps (Equivalent Effort)
     # 1 SW Step ~ Global. Let's give WalkSAT N flips per step.
