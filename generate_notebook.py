@@ -49,44 +49,22 @@ def add_code(source_string):
 # --- Content ---
 
 # 1. Intro Markdown
-# Using raw string r"""...""" to handle LaTeX backslashes correctly without escaping them for Python
-intro_text = r"""# Higher-Order Swendsen-Wang Dynamics for 3-SAT (Triangle + Tetrahedron)
+intro_text = r"""# Stochastic Higher-Order Swendsen-Wang Dynamics for 3-SAT
 
-This notebook implements a cutting-edge **Cluster Monte Carlo** algorithm for solving 3-SAT problems, bridging Statistical Physics and Combinatorial Optimization.
+This notebook implements an advanced **Stochastic Cluster Monte Carlo** algorithm.
+It combines global cluster moves (Swendsen-Wang) with local heuristics derived from UNSAT clauses (Focusing).
 
-## The Physics Model
-We map the 3-SAT problem onto a **Spatially Embedded Spin System** with higher-order interactions.
+## The Algorithm
+1.  **Marking**: Variables involved in UNSAT clauses are "marked".
+2.  **Hybrid Dynamics**:
+    *   **Tetrahedrons (Fully SAT)**: Connect Ghost to UNMARKED variables. If all marked, connect to one random variable.
+    *   **Triangles (Low Energy)**:
+        *   Behavior depends on how many vertices are marked (0, 1, 2, 3).
+        *   Generally avoids freezing edges between marked variables.
+        *   Tries to connect satisfied literals to Ghost to stabilize them.
+3.  **Percolation & Flip**: Standard cluster flip step.
 
-### 1. Variables & Geometry
-Consider $N$ variables $\sigma_i \in \{-1, +1\}$. We augment the graph with a "Ghost Node" $\sigma_0 = +1$ (representing TRUE).
-Each 3-SAT clause $C_m = (l_1 \lor l_2 \lor l_3)$ is encoded by two geometric structures:
-1.  **A Triangle ($\mathcal{T}$)**: Connecting the 3 variables involved in the clause.
-2.  **A Tetrahedron ($\mathcal{K}$)**: Connecting the Triangle to the Ghost Node $\sigma_0$.
-
-### 2. Interactions & Colors
-The edges are colored (signed) to encode the literals:
-*   **Triangle Edges**: An edge $(i, j)$ is **Antiferromagnetic** (Red, $J=-1$) if literals $l_i, l_j$ have the **same sign**. It is **Ferromagnetic** (Blue, $J=+1$) if they have **opposite signs**. This makes the triangle *Inherently Contradictory* (Frustrated).
-*   **Tetrahedron Edges**: An edge $(0, i)$ connecting to the Ghost is Ferromagnetic if $l_i$ is positive ($x_i$), and Antiferromagnetic if $l_i$ is negative ($\neg x_i$). 
-
-### 3. Dynamics & Weights
-We introduce a coupling parameter $\omega$ (playing the role of inverse temperature/interaction strength).
-
-*   **Tetrahedron (Weight $\omega$)**: If the clause is **FULLY SATISFIED** (ALL 3 literals match $\sigma_0$), we freeze the **entire tetrahedron** (all 3 edges) with probability $1 - e^{-\omega}$.
-*   **Triangle (Weight $\omega/2$)**: The triangle is an *isotropic inherently contradictory* loop. It fluctuates between two energy levels:
-    *   **Low Energy ($\E_0 = \omega/2$)**: 1 unsatisfied edge (Frustration limit).
-    *   **High Energy ($\E_1 = 3\omega/2$)**: 3 unsatisfied edges.
-    *   **Dynamics**: We follow the *SODA 2026 / Asilomar 2025* prescription (Table 3.1) to freeze specific subsets of edges based on the configuration state.
-*   **Ghost Node Invariant**: The Ghost Node $\sigma_0$ represents the "TRUE" state (+1). If it flips to -1 after a cluster update, we flip the entire system ($\sigma \to -\sigma$) to restore the gauge.
-
-### 4. Energy Landscape
-The global Hamiltonian is constructed such that:
-*   **Satisfied Clause**: Energy $\mathcal{H} = 3\omega/2$.
-*   **Unsatisfied Clause**: Energy $\mathcal{H} = 5\omega/2$.
-
-We perform **Simulated Annealing** by increasing $\omega$ over time, effectively lowering the temperature.
-
-""" # This is the end of intro_text
-
+"""
 add_markdown(intro_text)
 
 # 2. Setup Code
@@ -128,242 +106,344 @@ def generate_random_3sat(N, alpha, seed=None):
     vars = np.random.randint(1, N + 1, size=(M, 3))
     signs = np.random.choice([-1, 1], size=(M, 3))
     return vars * signs, N
-
-def parse_dimacs(content):
-    clauses = []
-    N = 0
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith(('c', '%')):
-            continue
-        if line.startswith('p'):
-            N = int(line.split()[2])
-            continue
-        try:
-            lits = [int(x) for x in line.split() if x != '0']
-            if len(lits) == 3:
-                clauses.append(lits)
-        except:
-            pass
-    return np.array(clauses, dtype=np.int32), N
-
-def download_instance(url):
-    print(f"Downloading {url}...")
-    resp = requests.get(url)
-    content = resp.content
-    if url.endswith('.tar.gz'):
-        with tarfile.open(fileobj=io.BytesIO(content), mode='r:gz') as tar:
-            for m in tar.getmembers():
-                if m.name.endswith('.cnf'):
-                    return parse_dimacs(tar.extractfile(m).read().decode('utf-8'))
-    return parse_dimacs(content.decode('utf-8'))"""
+"""
 add_code(data_gen_code)
 
-# 4. Solver Code
-# Note: Using raw string r"""...""" for code block as well just in case, though standard triple quote is usually fine.
-solver_code = r"""# @title 3. The Solver: `SwendsenWangTrianglesGPU`
+# 4. Stochastic Solver Code
+solver_code = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
 
-class SwendsenWangTrianglesGPU:
+class StochasticSwendsenWangGPU:
     def __init__(self, clauses_np, N):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
-        
-        # --- 1. Geometry Setup ---
-        # Node 0 is Ghost (+). Nodes 1..N are variables.
         self.GHOST = 0
         
-        # Extract literals (M, 3)
+        # Literals
         self.lits_idx = cp.abs(self.clauses)
         self.lits_sign = cp.sign(self.clauses)
         
-        # --- 2. Build Triangle Interactions (Internal) ---
-        # Edges: (0,1), (1,2), (2,0) relative to clause indices 0,1,2
-        # Sign Logic: Same Sign = AF (-1), Diff Sign = Ferro (+1)
-        # We store these as J_tri: (M, 3) corresponding to pairs (0,1), (1,2), (2,0)
-        
-        s = self.lits_sign # (M, 3)
-        # Pair (0,1)
+        # Interactions
+        s = self.lits_sign
         j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
-        # Pair (1,2)
         j12 = cp.where(s[:, 1] == s[:, 2], -1, 1)
-        # Pair (2,0)
         j20 = cp.where(s[:, 2] == s[:, 0], -1, 1)
-        
         self.J_tri = cp.stack([j01, j12, j20], axis=1).astype(cp.int8)
-        
-        # --- 3. Build Tetrahedron Interactions (to Ghost) ---
-        # J_tetra: (M, 3). Edge between lit k and Ghost.
-        # Lit > 0 (x) -> Match Ghost (+) -> Ferro (+1)
-        # Lit < 0 (not x) -> Mismatch Ghost (+) -> AF (-1)
         self.J_tetra = s.astype(cp.int8)
         
-        # Initialize Spins (0..N)
-        # 0 is fixed to 1. Others random.
+        # State
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
 
     def energy_check(self, omega):
-        # Computes global energy and verifies levels.
-        # Level 1 (SAT): 3*omega/2
-        # Level 2 (UNSAT): 5*omega/2
-        
-        # 1. Clause Satisfaction
-        # Lit satisfied if sigma[idx] == sign
         spins = self.sigma[self.lits_idx]
         is_lit_sat = (spins == self.lits_sign)
         is_clause_sat = cp.any(is_lit_sat, axis=1)
-        
-        # Energy Calculation (Formal Hamiltonian)
-        # This is a conceptual check. In our model, we just count SAT/UNSAT.
-        # But let's verify the user's "levels".
-        # If SAT: Energy should be 1.5 * omega
-        # If UNSAT: Energy should be 2.5 * omega
-        
-        total_E = cp.sum(cp.where(is_clause_sat, 1.5 * omega, 2.5 * omega))
-        avg_E_sat = 1.5 * omega
-        avg_E_unsat = 2.5 * omega
-        
         unsat_frac = 1.0 - cp.mean(is_clause_sat)
-        return total_E, unsat_frac
+        return unsat_frac
 
     def step(self, omega):
-        # Performs one Swendsen-Wang step using Triangle + Tetra dynamics.
-        # Optimized Logic (User Request):
-        # 1. If Clause is Fully Satisfied (3 lits true):
-        #    - Attempt to freeze Tetrahedron (all 3 edges to Ghost) with prob P.
-        #    - Do NOT attempt to freeze internal triangle edges (Exclusion).
-        # 2. Else If Clause is Partially Satisfied (1 or 2 lits true -> Low Energy Triangle):
-        #    - Attempt to freeze EXACTLY ONE internal triangle edge.
-        #    - 1st satisfied edge if rand < P/2.
-        #    - 2nd satisfied edge if P/2 <= rand < P.
-        # 3. Else (0 lits true -> High Energy):
-        #    - Freeze nothing.
-        
-        num_clauses = self.M
-        
-        # --- 1. Calculate Status ---
-        c_spins = self.sigma[self.lits_idx] # (M, 3)
-        
-        # A. Tetra Status (All lits match Ghost?)
-        # self.J_tetra is (M, 3) signs.
+        # 1. Calculate Clause Status
+        c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.J_tetra)
         num_lit_sat = cp.sum(lit_is_sat, axis=1)
+        
         is_fully_sat = (num_lit_sat == 3)
+        is_unsat = (num_lit_sat == 0) # High Energy / UNSAT Clause
         
-        # B. Triangle Status (Internal Frustration)
-        # s0, s1, s2 are the spins
-        s0 = c_spins[:, 0]
-        s1 = c_spins[:, 1]
-        s2 = c_spins[:, 2]
-        
-        # Check satisfaction: s_i * s_j * J_ij == 1
-        # self.J_tri is (M, 3) -> [J01, J12, J20]
+        # Triangle Internal Status
+        s0, s1, s2 = c_spins[:, 0], c_spins[:, 1], c_spins[:, 2]
         sat0 = (s0 * s1 * self.J_tri[:, 0] == 1)
         sat1 = (s1 * s2 * self.J_tri[:, 1] == 1)
         sat2 = (s2 * s0 * self.J_tri[:, 2] == 1)
-        
-        sat_mask = cp.stack([sat0, sat1, sat2], axis=1) # (M, 3)
+        sat_mask = cp.stack([sat0, sat1, sat2], axis=1)
         num_sat_tri = cp.sum(sat_mask, axis=1)
-        # Note: Low Energy for Isotropic Inherently Contradictory Triangles means "1 unsatisfied" (2 satisfied).
-        # This covers cases with 1, 2, or 3 lits true relative to Ghost.
-        # High Energy means "3 unsatisfied" (0 satisfied). This happens when 0 lits true relative to Ghost.
+        
+        # Low Energy Triangle = 2 satisfied edges (occurs when 1 or 2 lits sat)
+        # Note: In our signed construction, Fully SAT (3 lits) also implies Low Energy (2 edges).
+        # But we handle Fully SAT separately in Tetra logic.
         is_low_energy = (num_sat_tri == 2)
+
+        # 2. Marking Step
+        # Mark variables involved in UNSAT clauses
+        # is_unsat is boolean (M,)
+        # We need a boolean mask for variables (N+1)
         
-        # --- 2. Random Decision ---
-        # Probability threshold P = 1 - e^-omega
+        marked_vars = cp.zeros(self.N + 1, dtype=bool)
+        if cp.any(is_unsat):
+            unsat_vars = self.lits_idx[is_unsat].flatten()
+            marked_vars[unsat_vars] = True
+            
+        # Get Marked Status per Clause Literal
+        # (M, 3) boolean
+        lit_marked = marked_vars[self.lits_idx]
+        num_marked = cp.sum(lit_marked, axis=1) # 0, 1, 2, or 3
+        
+        # 3. Randomness
         P = 1.0 - cp.exp(-omega)
-        rand_vals = cp.random.random(num_clauses, dtype=cp.float32)
+        # We need a uniform random variable per clause to decide actions
+        rand_vals = cp.random.random(self.M, dtype=cp.float32)
         
-        # --- 3. Build Edges ---
         src_nodes = []
         dst_nodes = []
         
-        # A. Tetra Edges (Ghost <-> Var)
-        # Condition: Fully Sat AND rand < P
-        mask_tetra = is_fully_sat & (rand_vals < P)
-        if cp.any(mask_tetra):
-            idx_tetra = cp.where(mask_tetra)[0]
-            # Link Ghost (0) to all 3 vars in these clauses
-            # vars: self.lits_idx[idx_tetra] -> (K, 3)
-            targets = self.lits_idx[idx_tetra].flatten()
-            sources = cp.zeros_like(targets) # All 0
-            
-            src_nodes.append(sources)
-            dst_nodes.append(targets)
-            
-        # B. Triangle Edges (Var <-> Var)
-        # Condition: Low Energy AND NOT Fully Sat AND rand < P
-        # Using NOT Fully Sat enforces the "Else If" logic.
-        mask_tri = is_low_energy & (~is_fully_sat) & (rand_vals < P)
+        # --- A. Tetrahedron Logic (Fully SAT) ---
+        # Clause is Satisfied (3 lits).
+        # Condition: is_fully_sat
         
-        if cp.any(mask_tri):
-            idx_tri = cp.where(mask_tri)[0]
-            # Decision: Edge 1 or Edge 2?
-            # 1st satisfied edge if U < P/2
-            # 2nd satisfied edge if P/2 <= U < P
+        mask_A = is_fully_sat & (rand_vals < P)
+        if cp.any(mask_A):
+            idx_A = cp.where(mask_A)[0]
             
-            r_sub = rand_vals[mask_tri]
-            sub_sat = sat_mask[mask_tri] # (K, 3)
+            # Sub-masks for marked count within A
+            n_marked_A = num_marked[idx_A]
             
-            pick_first = (r_sub < (P / 2.0))
+            # Case A1: 3 Marked (All marked) -> Link Ghost to ONE random vertex
+            mask_A1 = (n_marked_A == 3)
+            if cp.any(mask_A1):
+                idx_A1 = idx_A[mask_A1]
+                # Pick one random lit (0, 1, 2)
+                # We can reuse rand_vals or gen new. Let's gen small new for selection
+                # Or use modulo of current rand? Cleaner to gen new.
+                r_sel = cp.random.randint(0, 3, size=len(idx_A1))
+                targets = self.lits_idx[idx_A1, r_sel]
+                src_nodes.append(cp.zeros_like(targets)) # Ghost
+                dst_nodes.append(targets)
             
-            # Find index of 1st True in each row
-            idx_1st = cp.argmax(sub_sat, axis=1)
+            # Case A2: Not all marked (< 3) -> Link Ghost to ALL UNMARKED vertices
+            mask_A2 = (n_marked_A < 3)
+            if cp.any(mask_A2):
+                idx_A2 = idx_A[mask_A2]
+                # Identify unmarked literals in these clauses
+                # lit_marked[idx_A2] is (K, 3) bool
+                # We want indices where lit_marked is False
+                unmarked_mask = ~lit_marked[idx_A2] # (K, 3)
+                
+                # We need to extract these.
+                # Use where on the mask
+                rows, cols = cp.where(unmarked_mask)
+                # Map back to global clause indices
+                clause_indices = idx_A2[rows]
+                # Get variable indices
+                targets = self.lits_idx[clause_indices, cols]
+                
+                src_nodes.append(cp.zeros_like(targets))
+                dst_nodes.append(targets)
+
+        # --- B. Triangle Logic (Low Energy & NOT Fully Sat) ---
+        # Condition: is_low_energy & (~is_fully_sat)
+        mask_B = is_low_energy & (~is_fully_sat) & (rand_vals < P)
+        
+        if cp.any(mask_B):
+            idx_B = cp.where(mask_B)[0]
+            n_marked_B = num_marked[idx_B]
             
-            # Find index of 2nd True
-            # Mask out the first one, then argmax again
-            temp = sub_sat.copy()
-            row_ids = cp.arange(len(idx_tri))
-            temp[row_ids, idx_1st] = False
-            idx_2nd = cp.argmax(temp, axis=1)
+            # Sub-logic based on marked count
             
-            # Choose
-            chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
-            
-            # Convert edge index (0,1,2) to variable pairs
-            # 0 -> (l0, l1), 1 -> (l1, l2), 2 -> (l2, l0)
-            
-            lits = self.lits_idx[idx_tri] # (K, 3)
-            l0 = lits[:, 0]
-            l1 = lits[:, 1]
-            l2 = lits[:, 2]
-            
-            # Source
-            s_edge = cp.where(chosen_edge_idx == 0, l0, 
-                             cp.where(chosen_edge_idx == 1, l1, l2))
-            # Dest
-            d_edge = cp.where(chosen_edge_idx == 0, l1,
-                             cp.where(chosen_edge_idx == 1, l2, l0))
-                             
-            src_nodes.append(s_edge)
-            dst_nodes.append(d_edge)
-            
+            # --- Case B3: 3 Marked ---
+            # Action: Link Ghost to ONE random SATISFIED literal
+            # We need to identify satisfied literals first.
+            # In Low Energy (Not Fully Sat), we have 1 or 2 satisfied literals.
+            mask_B3 = (n_marked_B == 3)
+            if cp.any(mask_B3):
+                idx_B3 = idx_B[mask_B3]
+                # Get sat status (K, 3)
+                sat_lits_B3 = lit_is_sat[idx_B3]
+                
+                # We need to pick one True value per row randomly
+                # Trick: Multiply by random, pick argmax
+                r_sel = cp.random.random(sat_lits_B3.shape, dtype=cp.float32)
+                r_sel = r_sel * sat_lits_B3 # Zero out unsat
+                chosen_col = cp.argmax(r_sel, axis=1)
+                
+                targets = self.lits_idx[idx_B3, chosen_col]
+                src_nodes.append(cp.zeros_like(targets))
+                dst_nodes.append(targets)
+
+            # --- Case B2: 2 Marked ---
+            mask_B2 = (n_marked_B == 2)
+            if cp.any(mask_B2):
+                idx_B2 = idx_B[mask_B2]
+                # Identify the single Unmarked vertex (col index)
+                # lit_marked[idx_B2] has two True and one False
+                unmarked_col = cp.argmin(lit_marked[idx_B2], axis=1) # argmin of bool gives index of False
+                
+                # Check if Unmarked vertex is Satisfied
+                # lit_is_sat[idx_B2, unmarked_col]
+                # We need fancy indexing
+                row_ids = cp.arange(len(idx_B2))
+                is_unmarked_sat = lit_is_sat[idx_B2, unmarked_col]
+                
+                # Subcase B2.1: Unmarked is SAT -> Link Ghost to Unmarked
+                if cp.any(is_unmarked_sat):
+                    sub_idx = row_ids[is_unmarked_sat] # Local indices
+                    real_idx = idx_B2[sub_idx]
+                    cols = unmarked_col[sub_idx]
+                    
+                    targets = self.lits_idx[real_idx, cols]
+                    src_nodes.append(cp.zeros_like(targets))
+                    dst_nodes.append(targets)
+                    
+                # Subcase B2.2: Unmarked is UNSAT -> Freeze one internal SAT edge, NOT connecting the 2 marked
+                # The 2 marked vertices are at indices != unmarked_col
+                # The edge connecting the two marked vertices is opposite to unmarked_col.
+                # Edge 0 connects (0,1), Edge 1 connects (1,2), Edge 2 connects (2,0).
+                # If unmarked is 2, marked are 0,1. Edge 0 connects them.
+                # We must FORBID Edge = unmarked_col.
+                # We must choose a Satisfied Edge that is NOT unmarked_col.
+                
+                is_unmarked_unsat = ~is_unmarked_sat
+                if cp.any(is_unmarked_unsat):
+                    sub_idx = row_ids[is_unmarked_unsat]
+                    real_idx = idx_B2[sub_idx]
+                    forbidden_edge = unmarked_col[sub_idx] # This is the edge index connecting the two marked vars?
+                    # Wait: Edge 0 connects l0-l1. If l2 is unmarked (so l0, l1 marked), Edge 0 connects marked.
+                    # So yes, forbidden_edge index == unmarked_vertex index.
+                    
+                    # Available edges: {0,1,2} \ {forbidden}
+                    # Among available, we need a Satisfied one.
+                    # In Low Energy, 2 edges are Sat, 1 Unsat.
+                    # We just need to find a Sat edge != forbidden.
+                    
+                    # Global sat mask for these clauses
+                    c_sat_mask = sat_mask[real_idx] # (K, 3)
+                    
+                    # Mask out forbidden
+                    # We can clone and set forbidden to False
+                    temp_mask = c_sat_mask.copy()
+                    temp_mask[cp.arange(len(real_idx)), forbidden_edge] = False
+                    
+                    # Now pick any True edge index
+                    # Since it's Low Energy, there should be at least one remaining (unless the only 2 sat edges were... wait)
+                    # If 2 edges are sat. 1 is forbidden. Is it possible the other sat is also forbidden? No, 1 forbidden.
+                    # Is it possible the *only* sat edges are forbidden? No, logic says 2 sat edges. We forbid 1. At least 1 left.
+                    
+                    target_edge = cp.argmax(temp_mask, axis=1)
+                    
+                    # Convert edge to vars
+                    lits = self.lits_idx[real_idx]
+                    l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
+                    
+                    s_e = cp.where(target_edge==0, l0, cp.where(target_edge==1, l1, l2))
+                    d_e = cp.where(target_edge==0, l1, cp.where(target_edge==1, l2, l0))
+                    src_nodes.append(s_e)
+                    dst_nodes.append(d_e)
+
+            # --- Case B1: 1 Marked ---
+            mask_B1 = (n_marked_B == 1)
+            if cp.any(mask_B1):
+                idx_B1 = idx_B[mask_B1]
+                # Identify Marked vertex (col index)
+                marked_col = cp.argmax(lit_marked[idx_B1], axis=1)
+                
+                # Check Edge opposite to Marked (index == marked_col)
+                # Is it Satisfied?
+                # sat_mask[idx_B1, marked_col]
+                row_ids = cp.arange(len(idx_B1))
+                is_opp_sat = sat_mask[idx_B1, marked_col]
+                
+                # Subcase B1.1: Opp Edge SAT -> Freeze it
+                if cp.any(is_opp_sat):
+                    sub_idx = row_ids[is_opp_sat]
+                    real_idx = idx_B1[sub_idx]
+                    target_edge = marked_col[sub_idx]
+                    
+                    lits = self.lits_idx[real_idx]
+                    l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
+                    s_e = cp.where(target_edge==0, l0, cp.where(target_edge==1, l1, l2))
+                    d_e = cp.where(target_edge==0, l1, cp.where(target_edge==1, l2, l0))
+                    src_nodes.append(s_e)
+                    dst_nodes.append(d_e)
+                
+                # Subcase B1.2: Opp Edge UNSAT
+                is_opp_unsat = ~is_opp_sat
+                if cp.any(is_opp_unsat):
+                    sub_idx = row_ids[is_opp_unsat]
+                    real_idx = idx_B1[sub_idx]
+                    m_col = marked_col[sub_idx]
+                    
+                    # Check Marked Vertex Sat Status
+                    is_marked_lit_sat = lit_is_sat[real_idx, m_col]
+                    
+                    # B1.2.a: Marked Lit is UNSAT (=> The other 2 are SAT, since Low Energy usually implies 1 or 2 sat lits)
+                    # If Marked is Unsat, and Opp Edge is Unsat... wait.
+                    # Triangle Logic: J1*J2*J3 = -1.
+                    # Spins: M(Unsat), A(Sat), B(Sat).
+                    # Check consistency.
+                    # User says: "Link Ghost to one of the two others (randomly)"
+                    
+                    mask_a = (~is_marked_lit_sat)
+                    if cp.any(mask_a):
+                        # Pick one of the other 2 cols
+                        # The other cols are (m_col+1)%3 and (m_col+2)%3
+                        idx_a = real_idx[mask_a]
+                        mc = m_col[mask_a]
+                        
+                        r_choice = cp.random.randint(0, 2, size=len(idx_a)) # 0 or 1
+                        # If 0 -> +1, If 1 -> +2
+                        offset = r_choice + 1
+                        target_col = (mc + offset) % 3
+                        
+                        targets = self.lits_idx[idx_a, target_col]
+                        src_nodes.append(cp.zeros_like(targets))
+                        dst_nodes.append(targets)
+                        
+                    # B1.2.b: Marked Lit is SAT
+                    # User says: "Link Ghost to Marked Lit"
+                    mask_b = (is_marked_lit_sat)
+                    if cp.any(mask_b):
+                        idx_b = real_idx[mask_b]
+                        mc = m_col[mask_b]
+                        targets = self.lits_idx[idx_b, mc]
+                        src_nodes.append(cp.zeros_like(targets))
+                        dst_nodes.append(targets)
+
+            # --- Case B0: 0 Marked ---
+            # Standard Swendsen-Wang Triangle Step
+            mask_B0 = (n_marked_B == 0)
+            if cp.any(mask_B0):
+                idx_B0 = idx_B[mask_B0]
+                # Pick one of the 2 satisfied edges randomly
+                sub_sat = sat_mask[idx_B0] # (K, 3)
+                
+                # Random selection logic
+                # P/2 split is already handled by 'rand_vals < P'? No, P is global.
+                # We need to split the population of B0 into "Pick 1st" and "Pick 2nd"
+                # using the existing random numbers r_sub corresponding to these?
+                # User logic: "Randomly pick one".
+                
+                # Reuse rand_vals
+                r_vals = rand_vals[mask_B][mask_B0]
+                # Re-normalize to 0..1 range? Or just parity?
+                # Let's check bit 0 or just < 0.5 * P (approx)
+                # Since rand < P, and P is small, we can check < P/2
+                
+                pick_first = (r_vals < (P / 2.0))
+                
+                idx_1st = cp.argmax(sub_sat, axis=1)
+                
+                temp = sub_sat.copy()
+                row_ids = cp.arange(len(idx_B0))
+                temp[row_ids, idx_1st] = False
+                idx_2nd = cp.argmax(temp, axis=1)
+                
+                chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
+                
+                lits = self.lits_idx[idx_B0]
+                l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
+                s_e = cp.where(chosen_edge_idx==0, l0, cp.where(chosen_edge_idx==1, l1, l2))
+                d_e = cp.where(chosen_edge_idx==0, l1, cp.where(chosen_edge_idx==1, l2, l0))
+                src_nodes.append(s_e)
+                dst_nodes.append(d_e)
+
         # --- 4. Cluster & Flip ---
         if len(src_nodes) > 0:
             all_src = cp.concatenate(src_nodes)
             all_dst = cp.concatenate(dst_nodes)
             
-            # Build Graph
-            # Fix: CuPy sparse/graph utils often require numeric types (float/int), not bool
             data = cp.ones(len(all_src), dtype=cp.float32)
             adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
-            
-            # Component Labeling
             n_comps, labels = cpx_graph.connected_components(adj, directed=False)
-            
-            # --- Percolation Analysis ---
-            comp_sizes = cp.bincount(labels)
-            sorted_sizes = cp.sort(comp_sizes)[::-1]
-            
-            c1_size = sorted_sizes[0]
-            if n_comps > 1:
-                c2_size = sorted_sizes[1]
-            else:
-                c2_size = 0.0
-                
-            c1_frac = c1_size / float(self.N + 1)
-            c2_frac = c2_size / float(self.N + 1)
             
             # Flip Logic
             ghost_label = labels[0]
@@ -375,30 +455,23 @@ class SwendsenWangTrianglesGPU:
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1 
         else:
-            c1_frac = 1.0 / (self.N + 1)
-            c2_frac = 1.0 / (self.N + 1)
-            
             flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N+1)
             self.sigma *= flips
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1
             
-        return self.energy_check(omega)[1], c1_frac, c2_frac # Return unsat, c1, c2
+        return self.energy_check(omega)
 """
 add_code(solver_code)
 
-# 5. Baseline Code
+# 5. Baseline (Metropolis)
 baseline_code = """# @title 4. Baseline: `MetropolisGPU`
-
 class MetropolisGPU:
     def __init__(self, clauses_np, N):
-        print(f"Initializing MetropolisGPU with N={N}...")
         self.N = N
-        # Convert to CuPy array first (Explicit Fix)
         clauses_cp = cp.array(clauses_np, dtype=cp.int32)
         self.lits_idx = cp.abs(clauses_cp)
         self.lits_sign = cp.sign(clauses_cp).astype(cp.int8)
-        # Use a separate spin array
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
 
@@ -409,135 +482,75 @@ class MetropolisGPU:
         return 1.0 - cp.mean(clause_sat)
 
     def step(self, beta):
-        # Parallel Metropolis (Checkerboard-like or Batch)
-        # We pick N/10 random indices to flip
         n_flip = max(1, self.N // 100)
         idx = cp.random.randint(1, self.N + 1, size=n_flip)
-        
         e_old = self.energy()
-        # Flip
         self.sigma[idx] *= -1
         e_new = self.energy()
-        
         delta = e_new - e_old
-        # Since energy is fraction unsat, we need to scale by M for actual Hamiltonian difference
-        # H ~ M * unsat.
-        # P = exp(-beta * M * delta)
-        # Note: User said beta proportional to omega. 
-        # If omega is O(1), and energy is O(1), beta should be O(M) or similar?
-        # Let's assume passed beta is the effective coupling.
-        
         if delta > 0:
-            p = cp.exp(-beta * delta * 100.0) # Scaling factor for sensitivity
+            p = cp.exp(-beta * delta * 100.0)
             if cp.random.random() > p:
-                self.sigma[idx] *= -1 # Reject"""
+                self.sigma[idx] *= -1
+"""
 add_code(baseline_code)
 
-# 6. Main Loop Code
-main_code = r"""# @title 5. Main Simulation Loop (Annealing)
-
-# Config
+# 6. Main Loop
+main_code = r"""# @title 5. Main Simulation Loop
 N = 500
-alpha = 4.25 # Hard region
+alpha = 4.25
 clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
-
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
-solver = SwendsenWangTrianglesGPU(clauses_np, N)
+# Use the New Solver
+solver = StochasticSwendsenWangGPU(clauses_np, N)
 metro = MetropolisGPU(clauses_np, N)
 
-# Schedule
 steps = 200
-omega_start = 0.5
-omega_end = 6.0
-omega_schedule = np.linspace(omega_start, omega_end, steps)
+omega_schedule = np.linspace(0.5, 6.0, steps)
 
 history_sw = []
-history_c1 = []
-history_c2 = []
 history_mh = []
 
 t0 = time.time()
 print("Starting Annealing...")
 
 for i, omega in enumerate(omega_schedule):
-    # 1. Swendsen-Wang Step
-    unsat_sw, c1, c2 = solver.step(omega)
+    # Stochastic SW Step
+    unsat_sw = solver.step(omega)
     
-    # Store SW Energy
-    if hasattr(unsat_sw, 'get'):
-        history_sw.append(float(unsat_sw.get()))
-    else:
-        history_sw.append(float(unsat_sw))
-        
-    # Store Cluster Sizes
-    if hasattr(c1, 'get'):
-        history_c1.append(float(c1.get()))
-    else:
-        history_c1.append(float(c1))
-        
-    if hasattr(c2, 'get'):
-        history_c2.append(float(c2.get()))
-    else:
-        history_c2.append(float(c2))
+    if hasattr(unsat_sw, 'get'): history_sw.append(float(unsat_sw.get()))
+    else: history_sw.append(float(unsat_sw))
     
-    # 2. Metropolis Step
-    # Heuristic scaling for beta to match omega's constraining power
+    # Metropolis Step
     beta = omega * 5.0 
-    # Run multiple sub-steps for fair comparison (SW is global)
-    for _ in range(5):
-        metro.step(beta)
+    for _ in range(5): metro.step(beta)
     
     e_mh = metro.energy()
-    if hasattr(e_mh, 'get'):
-        history_mh.append(float(e_mh.get()))
-    else:
-        history_mh.append(float(e_mh))
+    if hasattr(e_mh, 'get'): history_mh.append(float(e_mh.get()))
+    else: history_mh.append(float(e_mh))
     
     if i % 20 == 0:
-        print(f"Step {i:3d} | Omega {omega:.2f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.2f}) | MH Unsat: {history_mh[-1]:.4f}")
+        print(f"Step {i:3d} | Omega {omega:.2f} | SW Unsat: {unsat_sw:.4f} | MH Unsat: {history_mh[-1]:.4f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
 
 # Plot
-# Ensure inputs are on CPU (NumPy) before plotting
-omega_cpu = omega_schedule.get() if hasattr(omega_schedule, 'get') else omega_schedule
+omega_cpu = omega_schedule
 sw_cpu = np.array(history_sw)
-c1_cpu = np.array(history_c1)
-c2_cpu = np.array(history_c2)
 mh_cpu = np.array(history_mh)
 
-print(f"Plotting types: Omega={type(omega_cpu)}, SW={type(sw_cpu)}")
-
-fig, ax1 = plt.subplots(figsize=(12, 7))
-
-# Left Axis: Energy
-color_sw = 'cyan'
-color_mh = 'orange'
-ax1.set_xlabel(r'Coupling $\omega$ (Inverse Temp)')
-ax1.set_ylabel('Fraction Unsatisfied Clauses', color='white')
-l1, = ax1.plot(omega_cpu, sw_cpu, label='SW Energy', color=color_sw, linewidth=2)
-l2, = ax1.plot(omega_cpu, mh_cpu, label='MH Energy', color=color_mh, alpha=0.6)
-ax1.tick_params(axis='y', labelcolor='white')
-ax1.grid(True, alpha=0.2)
-
-# Right Axis: Cluster Sizes
-ax2 = ax1.twinx()
-color_c1 = 'magenta'
-color_c2 = 'lime'
-ax2.set_ylabel('Cluster Size Fraction (Percolation)', color='white')
-l3, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (C1)', color=color_c1, linestyle='--', linewidth=1.5)
-l4, = ax2.plot(omega_cpu, c2_cpu, label='2nd Largest (C2)', color=color_c2, linestyle=':', linewidth=1.5)
-ax2.tick_params(axis='y', labelcolor='white')
-
-# Combine legends
-lines = [l1, l2, l3, l4]
-labels = [l.get_label() for l in lines]
-ax1.legend(lines, labels, loc='center right')
-
-plt.title(rf'3-SAT Annealing: N={N}, $\alpha$={alpha} | Topo-Percolation')
-plt.show()"""
+plt.figure(figsize=(10, 6))
+plt.plot(omega_cpu, sw_cpu, label='Stochastic SW', color='cyan')
+plt.plot(omega_cpu, mh_cpu, label='Metropolis', color='orange', alpha=0.6)
+plt.xlabel(r'Coupling $\omega$')
+plt.ylabel('Fraction Unsatisfied')
+plt.title(f'Stochastic SW vs MH (N={N}, Alpha={alpha})')
+plt.legend()
+plt.grid(True, alpha=0.2)
+plt.show()
+"""
 add_code(main_code)
 
 with open("Swendsen-Wang_3SAT_Colab.ipynb", "w", encoding="utf-8") as f:
