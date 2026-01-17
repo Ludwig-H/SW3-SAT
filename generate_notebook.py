@@ -471,7 +471,7 @@ ax1 = plt.gca()
 # Energy Axis
 l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW Energy', color='cyan', linewidth=2)
 l2, = ax1.plot(omega_cpu, mh_cpu, label='Metropolis Energy', color='orange', alpha=0.6)
-ax1.set_xlabel(r'Coupling $\\omega$')
+ax1.set_xlabel(r'Coupling $\omega$')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
 ax1.grid(True, alpha=0.2)
