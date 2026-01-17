@@ -58,6 +58,7 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
     *   **New**: Uses **Exact Hamiltonian Cluster Updates** (Exact Energy Delta) for decision.
+    *   **Schedule**: Logarithmic annealing (dense near $\\omega_{max}$). 
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
@@ -181,8 +182,6 @@ class StochasticSwendsenWangGPU:
         dst_nodes = []
         
         # --- Tetra & Triangle Logic (Swendsen-Wang Edges) ---
-        # ... (Same as before, reusing logic for building graph) ...
-        # (Simplified for brevity in this prompt logic, keeping previous blocks)
         
         # --- A. Tetrahedron Logic (Fully SAT) ---
         mask_A = is_fully_sat & (rand_vals < P)
@@ -339,92 +338,35 @@ class StochasticSwendsenWangGPU:
             c2_frac = c2_size / float(self.N + 1)
             
             # --- EXACT HAMILTONIAN CLUSTER UPDATE ---
-            
-            # We want to compute Delta_E = (New Unsat) - (Old Unsat) for each cluster if flipped.
-            # But "Unsat" counts are usually integers. Here we define Energy = Unsat Fraction?
-            # Let's work with raw Clause Counts (Integers).
-            # Delta_Score > 0 means Energy DECREASES (Satisfied clauses INCREASE).
-            # So Score = (New Sat) - (Old Sat).
-            
             cluster_votes = cp.zeros(n_comps, dtype=cp.int32)
             
-            # Helper to get cluster IDs for all literals in clauses
-            # lits_idx shape (M, 3)
             lit_clusters = labels[self.lits_idx] # (M, 3)
-            
-            # Current Sat Status of all clauses
-            # lit_is_sat shape (M, 3)
-            # is_clause_sat_curr shape (M)
             is_clause_sat_curr = cp.any(lit_is_sat, axis=1)
             
-            # We iterate over the 3 columns (literals) to see "What if cluster C flips?"
-            # A clause might have literals in clusters C1, C2, C3.
-            # We only consider flipping ONE cluster at a time.
-            # So for cluster C1, we check clauses where it appears.
-            
-            # Since we can't loop over clusters, we loop over columns (0, 1, 2)
-            # For each column, we assume THAT column's cluster is flipping.
-            
-            processed_pairs = cp.zeros((self.M, 3), dtype=bool) # To track uniqueness if needed?
-            # Actually, simpler:
-            # For a clause, get unique clusters involved.
-            # E.g. Clusters [10, 10, 5]. Unique: [10, 5].
-            # Compute Delta for 10, Delta for 5. Add to global accumulator.
-            
-            # Vectorized approach:
-            # 1. Expand to (M, 3)
-            # 2. For each pos (i, k), let C = lit_clusters[i, k].
-            # 3. Simulate flip of C:
-            #    - Lits in C change SAT status.
-            #    - Lits NOT in C keep SAT status.
-            #    - Re-evaluate clause SAT.
-            #    - Compute Delta.
-            # 4. Handle duplicates: If col 1 has same cluster as col 0, don't double count.
-            
+            # Loop over columns (literals) to simulate flip
             for col in range(3):
                 target_clusters = lit_clusters[:, col]
                 
-                # Check for duplicates with previous cols to avoid double counting for the same clause
+                # Check for duplicates with previous cols
                 is_duplicate = cp.zeros(self.M, dtype=bool)
                 for prev_col in range(col):
                     is_duplicate |= (lit_clusters[:, prev_col] == target_clusters)
                 
-                # We only compute delta for clauses where this cluster is "new" to our calc
                 mask_process = ~is_duplicate
-                
                 if not cp.any(mask_process):
                     continue
                     
-                # Identify which literals in the clause belong to the SAME cluster 'target_clusters'
-                # (Because if C flips, ALL literals of C in this clause flip)
                 mask_in_cluster = (lit_clusters == target_clusters[:, None]) # (M, 3)
-                
-                # New status for these literals: NOT their current status
-                # (Since they flip sign, and clause signs are fixed, 'is_sat' inverts)
-                # Wait: lit_is_sat depends on (sigma * sign). 
-                # If sigma flips, sigma' = -sigma.
-                # New sat = (-sigma * sign) > 0  => -(sigma*sign) > 0 => (sigma*sign) < 0.
-                # So yes, is_sat inverts.
-                
                 new_lit_sat = lit_is_sat.copy()
-                
-                # Logic: Where mask_in_cluster is True, invert the boolean
-                # We only care about rows where mask_process is True, but doing all is safe/fast.
                 new_lit_sat[mask_in_cluster] = ~new_lit_sat[mask_in_cluster]
                 
-                # Re-eval clause
                 is_clause_sat_new = cp.any(new_lit_sat, axis=1)
-                
-                # Delta Score (+1 if becomes SAT, -1 if becomes UNSAT)
-                # Cast to int: True=1, False=0
                 delta = is_clause_sat_new.astype(cp.int32) - is_clause_sat_curr.astype(cp.int32)
                 
-                # Accumulate only for valid rows
                 valid_indices = cp.where(mask_process)[0]
                 valid_clusters = target_clusters[valid_indices]
                 valid_deltas = delta[valid_indices]
                 
-                # Add at
                 cp.add.at(cluster_votes, valid_clusters, valid_deltas)
 
             # 3. Decision (Logistic)
@@ -612,7 +554,16 @@ solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 1000
-omega_schedule = np.linspace(0.25, 2.0, steps)
+omega_min = 0.25
+omega_max = 2.0
+
+# Logarithmic schedule dense towards omega_max
+# We use a geometric decay from 1 to epsilon, then map it to [min, max]
+# such that the small steps (density) happen near omega_max.
+epsilon = 1e-2 
+raw_decay = np.geomspace(1, epsilon, steps)
+decay_01 = (raw_decay - epsilon) / (1.0 - epsilon)
+omega_schedule = omega_max - (omega_max - omega_min) * decay_01
 
 # Init history arrays explicitely
 history_sw = []
@@ -668,7 +619,7 @@ ax1 = plt.gca()
 # Energy Axis
 l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW (GPU)', color='cyan', linewidth=2)
 l2, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT (CPU, N flips/step)', color='red', alpha=0.6)
-ax1.set_xlabel(r'Coupling $\omega$ (Time)')
+ax1.set_xlabel(r'Coupling $\\omega$ (Time)')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
 ax1.grid(True, alpha=0.2)
