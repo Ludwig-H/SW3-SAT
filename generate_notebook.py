@@ -160,189 +160,114 @@ class StochasticSwendsenWangGPU:
         num_sat_tri = cp.sum(sat_mask, axis=1)
         
         # Low Energy Triangle = 2 satisfied edges (occurs when 1 or 2 lits sat)
-        # Note: In our signed construction, Fully SAT (3 lits) also implies Low Energy (2 edges).
-        # But we handle Fully SAT separately in Tetra logic.
         is_low_energy = (num_sat_tri == 2)
 
         # 2. Marking Step
-        # Mark variables involved in UNSAT clauses
-        # is_unsat is boolean (M,)
-        # We need a boolean mask for variables (N+1)
-        
         marked_vars = cp.zeros(self.N + 1, dtype=bool)
         if cp.any(is_unsat):
             unsat_vars = self.lits_idx[is_unsat].flatten()
             marked_vars[unsat_vars] = True
             
-        # Get Marked Status per Clause Literal
-        # (M, 3) boolean
         lit_marked = marked_vars[self.lits_idx]
         num_marked = cp.sum(lit_marked, axis=1) # 0, 1, 2, or 3
         
         # 3. Randomness
         P = 1.0 - cp.exp(-omega)
-        # We need a uniform random variable per clause to decide actions
         rand_vals = cp.random.random(self.M, dtype=cp.float32)
         
         src_nodes = []
         dst_nodes = []
         
         # --- A. Tetrahedron Logic (Fully SAT) ---
-        # Clause is Satisfied (3 lits).
-        # Condition: is_fully_sat
-        
         mask_A = is_fully_sat & (rand_vals < P)
         if cp.any(mask_A):
             idx_A = cp.where(mask_A)[0]
-            
-            # Sub-masks for marked count within A
             n_marked_A = num_marked[idx_A]
             
-            # Case A1: 3 Marked (All marked) -> Link Ghost to ONE random vertex
+            # Case A1: 3 Marked
             mask_A1 = (n_marked_A == 3)
             if cp.any(mask_A1):
                 idx_A1 = idx_A[mask_A1]
-                # Pick one random lit (0, 1, 2)
-                # We can reuse rand_vals or gen new. Let's gen small new for selection
-                # Or use modulo of current rand? Cleaner to gen new.
                 r_sel = cp.random.randint(0, 3, size=len(idx_A1))
                 targets = self.lits_idx[idx_A1, r_sel]
-                src_nodes.append(cp.zeros_like(targets)) # Ghost
+                src_nodes.append(cp.zeros_like(targets))
                 dst_nodes.append(targets)
             
-            # Case A2: Not all marked (< 3) -> Link Ghost to ALL UNMARKED vertices
+            # Case A2: < 3 Marked
             mask_A2 = (n_marked_A < 3)
             if cp.any(mask_A2):
                 idx_A2 = idx_A[mask_A2]
-                # Identify unmarked literals in these clauses
-                # lit_marked[idx_A2] is (K, 3) bool
-                # We want indices where lit_marked is False
-                unmarked_mask = ~lit_marked[idx_A2] # (K, 3)
-                
-                # We need to extract these.
-                # Use where on the mask
+                unmarked_mask = ~lit_marked[idx_A2]
                 rows, cols = cp.where(unmarked_mask)
-                # Map back to global clause indices
                 clause_indices = idx_A2[rows]
-                # Get variable indices
                 targets = self.lits_idx[clause_indices, cols]
-                
                 src_nodes.append(cp.zeros_like(targets))
                 dst_nodes.append(targets)
 
         # --- B. Triangle Logic (Low Energy & NOT Fully Sat) ---
-        # Condition: is_low_energy & (~is_fully_sat)
         mask_B = is_low_energy & (~is_fully_sat) & (rand_vals < P)
         
         if cp.any(mask_B):
             idx_B = cp.where(mask_B)[0]
             n_marked_B = num_marked[idx_B]
             
-            # Sub-logic based on marked count
-            
-            # --- Case B3: 3 Marked ---
-            # Action: Link Ghost to ONE random SATISFIED literal
-            # We need to identify satisfied literals first.
-            # In Low Energy (Not Fully Sat), we have 1 or 2 satisfied literals.
+            # Case B3: 3 Marked
             mask_B3 = (n_marked_B == 3)
             if cp.any(mask_B3):
                 idx_B3 = idx_B[mask_B3]
-                # Get sat status (K, 3)
                 sat_lits_B3 = lit_is_sat[idx_B3]
-                
-                # We need to pick one True value per row randomly
-                # Trick: Multiply by random, pick argmax
                 r_sel = cp.random.random(sat_lits_B3.shape, dtype=cp.float32)
-                r_sel = r_sel * sat_lits_B3 # Zero out unsat
+                r_sel = r_sel * sat_lits_B3
                 chosen_col = cp.argmax(r_sel, axis=1)
-                
                 targets = self.lits_idx[idx_B3, chosen_col]
                 src_nodes.append(cp.zeros_like(targets))
                 dst_nodes.append(targets)
 
-            # --- Case B2: 2 Marked ---
+            # Case B2: 2 Marked
             mask_B2 = (n_marked_B == 2)
             if cp.any(mask_B2):
                 idx_B2 = idx_B[mask_B2]
-                # Identify the single Unmarked vertex (col index)
-                # lit_marked[idx_B2] has two True and one False
-                unmarked_col = cp.argmin(lit_marked[idx_B2], axis=1) # argmin of bool gives index of False
-                
-                # Check if Unmarked vertex is Satisfied
-                # lit_is_sat[idx_B2, unmarked_col]
-                # We need fancy indexing
+                unmarked_col = cp.argmin(lit_marked[idx_B2], axis=1)
                 row_ids = cp.arange(len(idx_B2))
                 is_unmarked_sat = lit_is_sat[idx_B2, unmarked_col]
                 
-                # Subcase B2.1: Unmarked is SAT -> Link Ghost to Unmarked
+                # B2.1: Unmarked is SAT
                 if cp.any(is_unmarked_sat):
-                    sub_idx = row_ids[is_unmarked_sat] # Local indices
+                    sub_idx = row_ids[is_unmarked_sat]
                     real_idx = idx_B2[sub_idx]
                     cols = unmarked_col[sub_idx]
-                    
                     targets = self.lits_idx[real_idx, cols]
                     src_nodes.append(cp.zeros_like(targets))
                     dst_nodes.append(targets)
                     
-                # Subcase B2.2: Unmarked is UNSAT -> Freeze one internal SAT edge, NOT connecting the 2 marked
-                # The 2 marked vertices are at indices != unmarked_col
-                # The edge connecting the two marked vertices is opposite to unmarked_col.
-                # Edge 0 connects (0,1), Edge 1 connects (1,2), Edge 2 connects (2,0).
-                # If unmarked is 2, marked are 0,1. Edge 0 connects them.
-                # We must FORBID Edge = unmarked_col.
-                # We must choose a Satisfied Edge that is NOT unmarked_col.
-                
+                # B2.2: Unmarked is UNSAT -> Freeze SAT edge (not connecting marked)
                 is_unmarked_unsat = ~is_unmarked_sat
                 if cp.any(is_unmarked_unsat):
                     sub_idx = row_ids[is_unmarked_unsat]
                     real_idx = idx_B2[sub_idx]
-                    forbidden_edge = unmarked_col[sub_idx] # This is the edge index connecting the two marked vars?
-                    # Wait: Edge 0 connects l0-l1. If l2 is unmarked (so l0, l1 marked), Edge 0 connects marked.
-                    # So yes, forbidden_edge index == unmarked_vertex index.
+                    forbidden_edge = unmarked_col[sub_idx]
                     
-                    # Available edges: {0,1,2} \ {forbidden}
-                    # Among available, we need a Satisfied one.
-                    # In Low Energy, 2 edges are Sat, 1 Unsat.
-                    # We just need to find a Sat edge != forbidden.
-                    
-                    # Global sat mask for these clauses
-                    c_sat_mask = sat_mask[real_idx] # (K, 3)
-                    
-                    # Mask out forbidden
-                    # We can clone and set forbidden to False
+                    c_sat_mask = sat_mask[real_idx]
                     temp_mask = c_sat_mask.copy()
                     temp_mask[cp.arange(len(real_idx)), forbidden_edge] = False
-                    
-                    # Now pick any True edge index
-                    # Since it's Low Energy, there should be at least one remaining (unless the only 2 sat edges were... wait)
-                    # If 2 edges are sat. 1 is forbidden. Is it possible the other sat is also forbidden? No, 1 forbidden.
-                    # Is it possible the *only* sat edges are forbidden? No, logic says 2 sat edges. We forbid 1. At least 1 left.
-                    
                     target_edge = cp.argmax(temp_mask, axis=1)
                     
-                    # Convert edge to vars
                     lits = self.lits_idx[real_idx]
                     l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
-                    
                     s_e = cp.where(target_edge==0, l0, cp.where(target_edge==1, l1, l2))
                     d_e = cp.where(target_edge==0, l1, cp.where(target_edge==1, l2, l0))
                     src_nodes.append(s_e)
                     dst_nodes.append(d_e)
 
-            # --- Case B1: 1 Marked ---
+            # Case B1: 1 Marked
             mask_B1 = (n_marked_B == 1)
             if cp.any(mask_B1):
                 idx_B1 = idx_B[mask_B1]
-                # Identify Marked vertex (col index)
                 marked_col = cp.argmax(lit_marked[idx_B1], axis=1)
-                
-                # Check Edge opposite to Marked (index == marked_col)
-                # Is it Satisfied?
-                # sat_mask[idx_B1, marked_col]
                 row_ids = cp.arange(len(idx_B1))
                 is_opp_sat = sat_mask[idx_B1, marked_col]
                 
-                # Subcase B1.1: Opp Edge SAT -> Freeze it
+                # B1.1: Opp Edge SAT
                 if cp.any(is_opp_sat):
                     sub_idx = row_ids[is_opp_sat]
                     real_idx = idx_B1[sub_idx]
@@ -355,41 +280,27 @@ class StochasticSwendsenWangGPU:
                     src_nodes.append(s_e)
                     dst_nodes.append(d_e)
                 
-                # Subcase B1.2: Opp Edge UNSAT
+                # B1.2: Opp Edge UNSAT
                 is_opp_unsat = ~is_opp_sat
                 if cp.any(is_opp_unsat):
                     sub_idx = row_ids[is_opp_unsat]
                     real_idx = idx_B1[sub_idx]
                     m_col = marked_col[sub_idx]
-                    
-                    # Check Marked Vertex Sat Status
                     is_marked_lit_sat = lit_is_sat[real_idx, m_col]
                     
-                    # B1.2.a: Marked Lit is UNSAT (=> The other 2 are SAT, since Low Energy usually implies 1 or 2 sat lits)
-                    # If Marked is Unsat, and Opp Edge is Unsat... wait.
-                    # Triangle Logic: J1*J2*J3 = -1.
-                    # Spins: M(Unsat), A(Sat), B(Sat).
-                    # Check consistency.
-                    # User says: "Link Ghost to one of the two others (randomly)"
-                    
+                    # B1.2.a: Marked Lit UNSAT
                     mask_a = (~is_marked_lit_sat)
                     if cp.any(mask_a):
-                        # Pick one of the other 2 cols
-                        # The other cols are (m_col+1)%3 and (m_col+2)%3
                         idx_a = real_idx[mask_a]
                         mc = m_col[mask_a]
-                        
-                        r_choice = cp.random.randint(0, 2, size=len(idx_a)) # 0 or 1
-                        # If 0 -> +1, If 1 -> +2
+                        r_choice = cp.random.randint(0, 2, size=len(idx_a))
                         offset = r_choice + 1
                         target_col = (mc + offset) % 3
-                        
                         targets = self.lits_idx[idx_a, target_col]
                         src_nodes.append(cp.zeros_like(targets))
                         dst_nodes.append(targets)
                         
-                    # B1.2.b: Marked Lit is SAT
-                    # User says: "Link Ghost to Marked Lit"
+                    # B1.2.b: Marked Lit SAT
                     mask_b = (is_marked_lit_sat)
                     if cp.any(mask_b):
                         idx_b = real_idx[mask_b]
@@ -398,33 +309,17 @@ class StochasticSwendsenWangGPU:
                         src_nodes.append(cp.zeros_like(targets))
                         dst_nodes.append(targets)
 
-            # --- Case B0: 0 Marked ---
-            # Standard Swendsen-Wang Triangle Step
+            # Case B0: 0 Marked
             mask_B0 = (n_marked_B == 0)
             if cp.any(mask_B0):
                 idx_B0 = idx_B[mask_B0]
-                # Pick one of the 2 satisfied edges randomly
-                sub_sat = sat_mask[idx_B0] # (K, 3)
-                
-                # Random selection logic
-                # P/2 split is already handled by 'rand_vals < P'? No, P is global.
-                # We need to split the population of B0 into "Pick 1st" and "Pick 2nd"
-                # using the existing random numbers r_sub corresponding to these?
-                # User logic: "Randomly pick one".
-                
-                # Reuse rand_vals
+                sub_sat = sat_mask[idx_B0]
                 r_vals = rand_vals[mask_B][mask_B0]
-                # Re-normalize to 0..1 range? Or just parity?
-                # Let's check bit 0 or just < 0.5 * P (approx)
-                # Since rand < P, and P is small, we can check < P/2
-                
                 pick_first = (r_vals < (P / 2.0))
                 
                 idx_1st = cp.argmax(sub_sat, axis=1)
-                
                 temp = sub_sat.copy()
-                row_ids = cp.arange(len(idx_B0))
-                temp[row_ids, idx_1st] = False
+                temp[cp.arange(len(idx_B0)), idx_1st] = False
                 idx_2nd = cp.argmax(temp, axis=1)
                 
                 chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
@@ -437,7 +332,7 @@ class StochasticSwendsenWangGPU:
                 dst_nodes.append(d_e)
 
         # --- 4. Cluster & Flip ---
-        # Initialize percolation metrics to avoid UnboundLocalError
+        # INITIALIZATION HERE IS CRITICAL
         c1_frac = 0.0
         c2_frac = 0.0
 
@@ -449,10 +344,22 @@ class StochasticSwendsenWangGPU:
             adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
             n_comps, labels = cpx_graph.connected_components(adj, directed=False)
             
-            # Flip Logic
-            ghost_label = labels[0]
-            cluster_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_comps)
+            # Percolation Analysis
+            comp_sizes = cp.bincount(labels)
+            sorted_sizes = cp.sort(comp_sizes)[::-1]
             
+            c1_size = sorted_sizes[0]
+            if n_comps > 1:
+                c2_size = sorted_sizes[1]
+            else:
+                c2_size = 0.0
+            
+            # ASSIGN VALUES HERE
+            c1_frac = c1_size / float(self.N + 1)
+            c2_frac = c2_size / float(self.N + 1)
+            
+            # Flip Logic
+            cluster_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_comps)
             flip_vector = cluster_flips[labels]
             self.sigma *= flip_vector
             
@@ -564,7 +471,7 @@ ax1 = plt.gca()
 # Energy Axis
 l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW Energy', color='cyan', linewidth=2)
 l2, = ax1.plot(omega_cpu, mh_cpu, label='Metropolis Energy', color='orange', alpha=0.6)
-ax1.set_xlabel(r'Coupling $\omega$')
+ax1.set_xlabel(r'Coupling $\\omega$')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
 ax1.grid(True, alpha=0.2)
