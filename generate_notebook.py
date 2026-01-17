@@ -653,7 +653,7 @@ for i, omega in enumerate(omega_schedule):
     history_ws.append(e_ws)
     
     if i % 20 == 0:
-        print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
+        print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
