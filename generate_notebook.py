@@ -57,7 +57,7 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
 1.  **Stochastic Swendsen-Wang (Ours)**:
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
-    *   **New**: Uses Cluster-Logistic flips (Sigmoid Vote) to anneal convergence.
+    *   **New**: Uses Cluster-Logistic flips with `beta_scale` to control determinism.
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
@@ -114,11 +114,12 @@ add_code(data_gen_code)
 solver_code = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
 
 class StochasticSwendsenWangGPU:
-    def __init__(self, clauses_np, N):
+    def __init__(self, clauses_np, N, beta_scale=10.0):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
         self.GHOST = 0
+        self.beta_scale = beta_scale # High value (10+) = Greedy, Low value (1) = HeatBath
         
         # Literals
         self.lits_idx = cp.abs(self.clauses)
@@ -375,19 +376,14 @@ class StochasticSwendsenWangGPU:
             cluster_votes = cp.bincount(labels, weights=vote_updates).astype(cp.int32)
             
             # 3. Decision (Logistic Soft-Decision)
-            # We use omega as the inverse temperature (beta).
-            # P(Flip) = sigmoid(vote * omega)
+            # P(Flip) = sigmoid(vote * omega * beta_scale)
+            # beta_scale increases determinism (sharpness)
             
-            # Cast for float math
-            scores = cluster_votes.astype(cp.float32) * omega
+            scores = cluster_votes.astype(cp.float32) * omega * self.beta_scale
             
-            # Logistic function: 1 / (1 + e^-x)
-            # If vote is positive -> prob > 0.5
-            # If vote is negative -> prob < 0.5
-            # If vote is 0 -> prob = 0.5
             probs = 1.0 / (1.0 + cp.exp(-scores))
             
-            # Random draw for each cluster (Vectorized = FAST)
+            # Random draw for each cluster
             r_vals = cp.random.random(n_comps, dtype=cp.float32)
             
             # -1 = Flip (if random < prob), 1 = Stay
@@ -569,7 +565,7 @@ clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
 # Use the New Solver
-solver = StochasticSwendsenWangGPU(clauses_np, N)
+solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 1000
@@ -613,7 +609,6 @@ for i, omega in enumerate(omega_schedule):
     if i % 20 == 0:
         # Use history arrays for printing to ensure consistency
         print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
-
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
