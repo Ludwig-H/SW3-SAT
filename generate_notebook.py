@@ -60,30 +60,30 @@ We map the 3-SAT problem onto a **Spatially Embedded Spin System** with higher-o
 ### 1. Variables & Geometry
 Consider $N$ variables $\sigma_i \in \{-1, +1\}$. We augment the graph with a "Ghost Node" $\sigma_0 = +1$ (representing TRUE).
 Each 3-SAT clause $C_m = (l_1 \lor l_2 \lor l_3)$ is encoded by two geometric structures:
-1.  **A Triangle ($\\mathcal{T}$)**: Connecting the 3 variables involved in the clause.
-2.  **A Tetrahedron ($\\mathcal{K}$)**: Connecting the Triangle to the Ghost Node $\sigma_0$.
+1.  **A Triangle ($\mathcal{T}$)**: Connecting the 3 variables involved in the clause.
+2.  **A Tetrahedron ($\mathcal{K}$)**: Connecting the Triangle to the Ghost Node $\sigma_0$.
 
 ### 2. Interactions & Colors
 The edges are colored (signed) to encode the literals:
 *   **Triangle Edges**: An edge $(i, j)$ is **Antiferromagnetic** (Red, $J=-1$) if literals $l_i, l_j$ have the **same sign**. It is **Ferromagnetic** (Blue, $J=+1$) if they have **opposite signs**. This makes the triangle *Inherently Contradictory* (Frustrated).
-*   **Tetrahedron Edges**: An edge $(0, i)$ connecting to the Ghost is Ferromagnetic if $l_i$ is positive ($x_i$), and Antiferromagnetic if $l_i$ is negative ($\\neg x_i$). 
+*   **Tetrahedron Edges**: An edge $(0, i)$ connecting to the Ghost is Ferromagnetic if $l_i$ is positive ($x_i$), and Antiferromagnetic if $l_i$ is negative ($\neg x_i$). 
 
 ### 3. Dynamics & Weights
-We introduce a coupling parameter $\\omega$ (playing the role of inverse temperature/interaction strength).
+We introduce a coupling parameter $\omega$ (playing the role of inverse temperature/interaction strength).
 
-*   **Tetrahedron (Weight $\\omega$)**: If the clause is **FULLY SATISFIED** (ALL 3 literals match $\\sigma_0$), we freeze the **entire tetrahedron** (all 3 edges) with probability $1 - e^{-\\omega}$.
-*   **Triangle (Weight $\\omega/2$)**: The triangle is an *isotropic inherently contradictory* loop. It fluctuates between two energy levels:
-    *   **Low Energy ($\\E_0 = \\omega/2$)**: 1 unsatisfied edge (Frustration limit).
-    *   **High Energy ($\\E_1 = 3\\omega/2$)**: 3 unsatisfied edges.
+*   **Tetrahedron (Weight $\omega$)**: If the clause is **FULLY SATISFIED** (ALL 3 literals match $\sigma_0$), we freeze the **entire tetrahedron** (all 3 edges) with probability $1 - e^{-\omega}$.
+*   **Triangle (Weight $\omega/2$)**: The triangle is an *isotropic inherently contradictory* loop. It fluctuates between two energy levels:
+    *   **Low Energy ($\E_0 = \omega/2$)**: 1 unsatisfied edge (Frustration limit).
+    *   **High Energy ($\E_1 = 3\omega/2$)**: 3 unsatisfied edges.
     *   **Dynamics**: We follow the *SODA 2026 / Asilomar 2025* prescription (Table 3.1) to freeze specific subsets of edges based on the configuration state.
-*   **Ghost Node Invariant**: The Ghost Node $\\sigma_0$ represents the "TRUE" state (+1). If it flips to -1 after a cluster update, we flip the entire system ($\\sigma \to -\\sigma$) to restore the gauge.
+*   **Ghost Node Invariant**: The Ghost Node $\sigma_0$ represents the "TRUE" state (+1). If it flips to -1 after a cluster update, we flip the entire system ($\sigma \to -\sigma$) to restore the gauge.
 
 ### 4. Energy Landscape
 The global Hamiltonian is constructed such that:
-*   **Satisfied Clause**: Energy $\\mathcal{H} = 3\\omega/2$.
-*   **Unsatisfied Clause**: Energy $\\mathcal{H} = 5\\omega/2$.
+*   **Satisfied Clause**: Energy $\mathcal{H} = 3\omega/2$.
+*   **Unsatisfied Clause**: Energy $\mathcal{H} = 5\omega/2$.
 
-We perform **Simulated Annealing** by increasing $\\omega$ over time, effectively lowering the temperature.
+We perform **Simulated Annealing** by increasing $\omega$ over time, effectively lowering the temperature.
 
 """ # This is the end of intro_text
 
@@ -229,157 +229,121 @@ class SwendsenWangTrianglesGPU:
 
     def step(self, omega):
         # Performs one Swendsen-Wang step using Triangle + Tetra dynamics.
+        # Optimized Logic (User Request):
+        # 1. If Clause is Fully Satisfied (3 lits true):
+        #    - Attempt to freeze Tetrahedron (all 3 edges to Ghost) with prob P.
+        #    - Do NOT attempt to freeze internal triangle edges (Exclusion).
+        # 2. Else If Clause is Partially Satisfied (1 or 2 lits true -> Low Energy Triangle):
+        #    - Attempt to freeze EXACTLY ONE internal triangle edge.
+        #    - 1st satisfied edge if rand < P/2.
+        #    - 2nd satisfied edge if P/2 <= rand < P.
+        # 3. Else (0 lits true -> High Energy):
+        #    - Freeze nothing.
         
         num_clauses = self.M
         
-        # --- A. Tetrahedron Dynamics (Freezing to Ghost) ---
-        # User Instruction: "Le tétraèdre n'est possiblement gelé que si *tous* les trois spins
-        # du triangle sont conforme à \\sigma_0. Alors avec probabilité 1-e^{-\\omega}, 
-        # il faut geler tout le tétraèdre."
-        
-        # Get spins for all literals in clauses
+        # --- 1. Calculate Status ---
         c_spins = self.sigma[self.lits_idx] # (M, 3)
         
-        # Check literal satisfaction vs Ghost (+1)
-        # lit_is_sat[m, k] is True if literal k of clause m is consistent with Ghost
+        # A. Tetra Status (All lits match Ghost?)
+        # self.J_tetra is (M, 3) signs.
         lit_is_sat = (c_spins == self.J_tetra)
+        num_lit_sat = cp.sum(lit_is_sat, axis=1)
+        is_fully_sat = (num_lit_sat == 3)
         
-        # Condition: ALL 3 spins must be conformant
-        tetra_fully_sat = cp.all(lit_is_sat, axis=1) # (M,)
-        
-        # Probability to freeze the WHOLE tetrahedron
-        p_tetra = 1.0 - cp.exp(-omega)
-        rand_tetra = cp.random.random(num_clauses, dtype=cp.float32)
-        
-        # Decision: Freeze if Fully Sat AND random < p
-        do_freeze_tetra = tetra_fully_sat & (rand_tetra < p_tetra) # (M,)
-        
-        # Broadcast decision to all 3 edges (M, 3)
-        # If do_freeze_tetra[m] is True, then freeze (m,0), (m,1), (m,2)
-        freeze_tetra = cp.stack([do_freeze_tetra]*3, axis=1)
-        
-        # --- B. Triangle Dynamics (Inherently Contradictory) ---
-        # Weight w = omega / 2
-        w = omega / 2.0
-        # Probabilities from PDF Table 3.1 (Right - Inherently Contradictory)
-        # p_freeze_1 = 0.5 * (1 - exp(-2w))
-        # High Energy State (3 unsat?): Freeze Empty set (Prob 1).
-        # Low Energy State (1 unsat): Freeze 1 satisfied edge (Prob p_freeze_1).
-        
-        # 1. Determine State of each triangle
-        # Edges 0:(0,1), 1:(1,2), 2:(2,0)
-        # Get spins
+        # B. Triangle Status (Internal Frustration)
+        # s0, s1, s2 are the spins
         s0 = c_spins[:, 0]
         s1 = c_spins[:, 1]
         s2 = c_spins[:, 2]
         
-        # Check satisfaction of internal edges
-        # Edge is sat if spin_i * spin_j * J == 1
-        # J stored in self.J_tri
-        sat0 = (s0 * s1 * self.J_tri[:, 0]) == 1
-        sat1 = (s1 * s2 * self.J_tri[:, 1]) == 1
-        sat2 = (s2 * s0 * self.J_tri[:, 2]) == 1
+        # Check satisfaction: s_i * s_j * J_ij == 1
+        # self.J_tri is (M, 3) -> [J01, J12, J20]
+        sat0 = (s0 * s1 * self.J_tri[:, 0] == 1)
+        sat1 = (s1 * s2 * self.J_tri[:, 1] == 1)
+        sat2 = (s2 * s0 * self.J_tri[:, 2] == 1)
         
         sat_mask = cp.stack([sat0, sat1, sat2], axis=1) # (M, 3)
-        num_sat = cp.sum(sat_mask, axis=1)
+        num_sat_tri = cp.sum(sat_mask, axis=1)
+        # Note: Low Energy for Isotropic Inherently Contradictory Triangles means "1 unsatisfied" (2 satisfied).
+        # This covers cases with 1, 2, or 3 lits true relative to Ghost.
+        # High Energy means "3 unsatisfied" (0 satisfied). This happens when 0 lits true relative to Ghost.
+        is_low_energy = (num_sat_tri == 2)
         
-        # In a frustrated triangle, max SAT edges is 2 (Low Energy), min is 0 (High Energy, if ferro) or 3 unsat?
-        # For -1, +1, +1 (AF, F, F):
-        # If +++: -1(U), +1(S), +1(S). 2 SAT. Low Energy.
-        # If +--: +1(S), +1(S), -1(U). 2 SAT. Low Energy.
-        # Check "High Energy": s1=1, s2=1, s3=-1. J=(-1, 1, 1).
-        # (1,1,J=-1)->U. (1,-1,J=1)->U. (-1,1,J=1)->U. 0 SAT. High Energy.
+        # --- 2. Random Decision ---
+        # Probability threshold P = 1 - e^-omega
+        P = 1.0 - cp.exp(-omega)
+        rand_vals = cp.random.random(num_clauses, dtype=cp.float32)
         
-        is_low_energy = (num_sat == 2)
-        # is_high_energy = (num_sat == 0) 
+        # --- 3. Build Edges ---
+        src_nodes = []
+        dst_nodes = []
         
-        # Dynamics:
-        # If High Energy (0 sat): Freeze Nothing (Empty).
-        # If Low Energy (2 sat): Freeze exactly ONE of the 2 satisfied edges.
-        # Prob to freeze = 0.5 * (1 - exp(-2w))
-        # Wait, PDF says "freeze exactly one... with probability 1/2(1-e^-2w)".
-        # Does it mean we might freeze NOTHING in Low Energy? Yes. 
-        # Total prob to freeze SOMETHING is (1 - e^-2w). Split between the 2 edges.
+        # A. Tetra Edges (Ghost <-> Var)
+        # Condition: Fully Sat AND rand < P
+        mask_tetra = is_fully_sat & (rand_vals < P)
+        if cp.any(mask_tetra):
+            idx_tetra = cp.where(mask_tetra)[0]
+            # Link Ghost (0) to all 3 vars in these clauses
+            # vars: self.lits_idx[idx_tetra] -> (K, 3)
+            targets = self.lits_idx[idx_tetra].flatten()
+            sources = cp.zeros_like(targets) # All 0
+            
+            src_nodes.append(sources)
+            dst_nodes.append(targets)
+            
+        # B. Triangle Edges (Var <-> Var)
+        # Condition: Low Energy AND NOT Fully Sat AND rand < P
+        # Using NOT Fully Sat enforces the "Else If" logic.
+        mask_tri = is_low_energy & (~is_fully_sat) & (rand_vals < P)
         
-        p_freeze_any = 1.0 - cp.exp(-2.0 * w)
-        # But we must pick WHICH one. Uniformly among the 2.
-        
-        rand_tri = cp.random.random(num_clauses, dtype=cp.float32)
-        
-        # Output mask for triangle edges (M, 3)
-        freeze_tri = cp.zeros((num_clauses, 3), dtype=bool)
-        
-        # Logic for Low Energy:
-        # If rand < p_freeze_any: we freeze ONE edge.
-        # Which one? The first satisfied or second satisfied?
-        # We need to select one of the TRUE values in sat_mask randomly.
-        
-        # Create a random selector for the 2 edges
-        # We can multiply sat_mask by random numbers and pick argmax
-        selector = cp.random.random((num_clauses, 3), dtype=cp.float32)
-        selector = selector * sat_mask # Zero out unsat edges
-        target_edge = cp.argmax(selector, axis=1) # Index of edge to freeze
-        
-        # Apply freeze
-        # Mask: Low Energy AND (rand < p_freeze_any)
-        do_freeze = is_low_energy & (rand_tri < p_freeze_any)
-        
-        # Set the bit
-        # We use fancy indexing. indices (0..M-1), target_edge
-        row_idxs = cp.arange(num_clauses)[do_freeze]
-        col_idxs = target_edge[do_freeze]
-        freeze_tri[row_idxs, col_idxs] = True
-        
-        # --- C. Graph Construction ---
-        # We need to build the adjacency matrix for Connected Components.
-        # Nodes: 0..N.
-        
-        # 1. Tetra Edges (Ghost-Variable)
-        # freeze_tetra is (M, 3). 
-        # Indices: (Ghost, lits_idx[m, 0]), etc.
-        t_rows, t_cols = cp.where(freeze_tetra)
-        # t_rows is clause index, t_cols is 0,1,2
-        # Map t_cols to variable index
-        var_indices = self.lits_idx[t_rows, t_cols]
-        
-        src_tetra = cp.zeros_like(var_indices) # All 0 (Ghost)
-        dst_tetra = var_indices
-        
-        # 2. Triangle Edges (Var-Var)
-        # freeze_tri is (M, 3). Pairs: (0,1), (1,2), (2,0)
-        tr_rows, tr_cols = cp.where(freeze_tri)
-        
-        # Map to variables
-        # if tr_cols == 0 -> edge between lit 0 and lit 1
-        # if tr_cols == 1 -> edge between lit 1 and lit 2
-        # if tr_cols == 2 -> edge between lit 2 and lit 0
-        
-        idx0 = self.lits_idx[tr_rows, 0]
-        idx1 = self.lits_idx[tr_rows, 1]
-        idx2 = self.lits_idx[tr_rows, 2]
-        
-        src_tri = cp.zeros_like(tr_rows)
-        dst_tri = cp.zeros_like(tr_rows)
-        
-        # Vectorized assignment
-        mask0 = (tr_cols == 0)
-        src_tri[mask0] = idx0[mask0]
-        dst_tri[mask0] = idx1[mask0]
-        
-        mask1 = (tr_cols == 1)
-        src_tri[mask1] = idx1[mask1]
-        dst_tri[mask1] = idx2[mask1]
-        
-        mask2 = (tr_cols == 2)
-        src_tri[mask2] = idx2[mask2]
-        dst_tri[mask2] = idx0[mask2]
-        
-        # Combine
-        all_src = cp.concatenate([src_tetra, src_tri])
-        all_dst = cp.concatenate([dst_tetra, dst_tri])
-        
-        # --- D. Cluster Flip ---
-        if len(all_src) > 0:
+        if cp.any(mask_tri):
+            idx_tri = cp.where(mask_tri)[0]
+            # Decision: Edge 1 or Edge 2?
+            # 1st satisfied edge if U < P/2
+            # 2nd satisfied edge if P/2 <= U < P
+            
+            r_sub = rand_vals[mask_tri]
+            sub_sat = sat_mask[mask_tri] # (K, 3)
+            
+            pick_first = (r_sub < (P / 2.0))
+            
+            # Find index of 1st True in each row
+            idx_1st = cp.argmax(sub_sat, axis=1)
+            
+            # Find index of 2nd True
+            # Mask out the first one, then argmax again
+            temp = sub_sat.copy()
+            row_ids = cp.arange(len(idx_tri))
+            temp[row_ids, idx_1st] = False
+            idx_2nd = cp.argmax(temp, axis=1)
+            
+            # Choose
+            chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
+            
+            # Convert edge index (0,1,2) to variable pairs
+            # 0 -> (l0, l1), 1 -> (l1, l2), 2 -> (l2, l0)
+            
+            lits = self.lits_idx[idx_tri] # (K, 3)
+            l0 = lits[:, 0]
+            l1 = lits[:, 1]
+            l2 = lits[:, 2]
+            
+            # Source
+            s_edge = cp.where(chosen_edge_idx == 0, l0, 
+                             cp.where(chosen_edge_idx == 1, l1, l2))
+            # Dest
+            d_edge = cp.where(chosen_edge_idx == 0, l1,
+                             cp.where(chosen_edge_idx == 1, l2, l0))
+                             
+            src_nodes.append(s_edge)
+            dst_nodes.append(d_edge)
+            
+        # --- 4. Cluster & Flip ---
+        if len(src_nodes) > 0:
+            all_src = cp.concatenate(src_nodes)
+            all_dst = cp.concatenate(dst_nodes)
+            
             # Build Graph
             # Fix: CuPy sparse/graph utils often require numeric types (float/int), not bool
             data = cp.ones(len(all_src), dtype=cp.float32)
@@ -388,19 +352,11 @@ class SwendsenWangTrianglesGPU:
             # Component Labeling
             n_comps, labels = cpx_graph.connected_components(adj, directed=False)
             
-            # --- Percolation Analysis (New) ---
-            # Calculate sizes of all components
-            # labels is an array of component IDs for each node
-            # We use bincount to count nodes per label
+            # --- Percolation Analysis ---
             comp_sizes = cp.bincount(labels)
-            
-            # Sort descending to get largest
             sorted_sizes = cp.sort(comp_sizes)[::-1]
             
-            # Largest component (C1)
             c1_size = sorted_sizes[0]
-            
-            # Second largest (C2) - handle case where only 1 component exists
             if n_comps > 1:
                 c2_size = sorted_sizes[1]
             else:
@@ -410,33 +366,18 @@ class SwendsenWangTrianglesGPU:
             c2_frac = c2_size / float(self.N + 1)
             
             # Flip Logic
-            # 1. Identify Ghost Cluster
             ghost_label = labels[0]
-            
-            # 2. Random Flips for all clusters
             cluster_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_comps)
             
-            # 3. Force Ghost Cluster to +1 (Keep Ghost Fixed)
-            # Standard SW: Flip clusters randomly.
-            # If the cluster containing Ghost (0) flips to -1, we flip EVERYTHING to restore Gauge.
-            # (Global Spin Flip symmetry)
-            
-            # Apply cluster flips first
             flip_vector = cluster_flips[labels]
             self.sigma *= flip_vector
             
-            # Check Ghost
             if self.sigma[self.GHOST] == -1:
-                self.sigma *= -1 # Flip everything back so Ghost is +1
+                self.sigma *= -1 
         else:
-            # No edges frozen. All free clusters (except 0).
-            # 1 Giant component? No, N components of size 1.
-            # Wait, if no edges, every node is its own component.
-            # So C1 = 1/(N+1), C2 = 1/(N+1)
             c1_frac = 1.0 / (self.N + 1)
             c2_frac = 1.0 / (self.N + 1)
             
-            # Flip everyone randomly except 0.
             flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=self.N+1)
             self.sigma *= flips
             if self.sigma[self.GHOST] == -1:
