@@ -623,6 +623,7 @@ walksat = WalkSAT(clauses_np, N)
 steps = 1000
 omega_schedule = np.linspace(0.25, 2.0, steps)
 
+# Init history arrays explicitely
 history_sw = []
 history_c1 = []
 history_c2 = []
@@ -633,16 +634,17 @@ print("Starting Comparison...")
 
 for i, omega in enumerate(omega_schedule):
     # Stochastic SW Step
-    unsat_sw, c1, c2 = solver.step(omega)
+    unsat_sw, c1_val, c2_val = solver.step(omega)
     
+    # Store values safely (handle cupy/numpy types)
     if hasattr(unsat_sw, 'get'): history_sw.append(float(unsat_sw.get()))
     else: history_sw.append(float(unsat_sw))
     
-    if hasattr(c1, 'get'): history_c1.append(float(c1.get()))
-    else: history_c1.append(float(c1))
+    if hasattr(c1_val, 'get'): history_c1.append(float(c1_val.get()))
+    else: history_c1.append(float(c1_val))
     
-    if hasattr(c2, 'get'): history_c2.append(float(c2.get()))
-    else: history_c2.append(float(c2))
+    if hasattr(c2_val, 'get'): history_c2.append(float(c2_val.get()))
+    else: history_c2.append(float(c2_val))
     
     # WalkSAT Steps (Equivalent Effort)
     # 1 SW Step ~ Global. Let's give WalkSAT N flips per step.
@@ -657,6 +659,7 @@ for i, omega in enumerate(omega_schedule):
     history_ws.append(e_ws)
     
     if i % 20 == 0:
+        # Use history arrays for printing to ensure consistency
         print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
 
 dt = time.time() - t0
