@@ -57,7 +57,7 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
 1.  **Stochastic Swendsen-Wang (Ours)**:
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
-    *   **New**: Uses Cluster-Greedy flips (Vote) to accelerate convergence.
+    *   **New**: Uses Cluster-Logistic flips (Sigmoid Vote) to anneal convergence.
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
@@ -352,100 +352,52 @@ class StochasticSwendsenWangGPU:
             c1_frac = c1_size / float(self.N + 1)
             c2_frac = c2_size / float(self.N + 1)
             
-            # --- CLUSTER GREEDY LOGIC (Vote) ---
+            # --- CLUSTER LOGISTIC LOGIC (Sigmoid Vote) ---
             
             # 1. Calculate local "vote" for each variable
             # Vote = (Sat if flip) - (Sat now)
-            # We assume current unsat clauses would become sat if we flip a var inside?
-            # Approximation:
-            # - If clause is UNSAT: All vars inside get +1 vote (flipping them helps).
-            # - If clause is SAT (with 1 lit true): That lit gets -1 vote (flipping it breaks).
-            # - If clause is SAT (with >1 lit true): No risk, vote 0.
-            
-            # lit_is_sat (M, 3) was computed earlier
-            # num_lit_sat (M)
-            
-            # Unsat Clauses (0 sat): All 3 vars get +1
             vote_updates = cp.zeros(self.N + 1, dtype=cp.int32)
             
-            # UNSAT Contribution
+            # UNSAT Contribution (+1)
             if cp.any(is_unsat):
                 unsat_v = self.lits_idx[is_unsat].flatten()
-                # We need to add +1 to these indices.
-                # bincount or add.at
-                # cupy.add.at works for in-place
                 cp.add.at(vote_updates, unsat_v, 1)
                 
-            # SAT-1 Contribution (Critical variables)
+            # SAT-1 Contribution (Critical variables) (-1)
             is_critical = (num_lit_sat == 1)
             if cp.any(is_critical):
-                # Identify the single true literal
                 crit_idx = cp.where(is_critical)[0]
-                # lit_is_sat[crit_idx] has exactly one True per row
                 crit_col = cp.argmax(lit_is_sat[crit_idx], axis=1)
-                
                 crit_vars = self.lits_idx[crit_idx, crit_col]
-                # Flipping these BREAKS the clause -> Vote -1
                 cp.add.at(vote_updates, crit_vars, -1)
                 
             # 2. Aggregate votes per cluster
-            # labels (N+1) gives cluster ID for each var
-            # We sum vote_updates based on labels
-            
-            cluster_votes = cp.zeros(n_comps, dtype=cp.int32)
-            # Add vote_updates to cluster_votes at index labels
-            # cpx.coo_matrix can sum? Or simpler:
-            # We can use another bincount if we handle negative weights?
-            # bincount supports weights. But weights must be... ? CuPy bincount weights can be float/int.
-            # But vote_updates can be negative. Does bincount support negative weights? Yes usually.
-            
             cluster_votes = cp.bincount(labels, weights=vote_updates).astype(cp.int32)
             
-            # 3. Decision
-            # If vote > 0: Flip
-            # If vote <= 0: Random (or stay?)
-            # To emulate "Random Walk" behavior when stuck, we keep 50% flip if vote == 0?
-            # Or Temperature based?
-            # Let's be aggressive:
-            # > 0: Flip (1.0)
-            # < 0: Stay (Flip 0.0)
-            # == 0: Random (0.5)
+            # 3. Decision (Logistic Soft-Decision)
+            # We use omega as the inverse temperature (beta).
+            # P(Flip) = sigmoid(vote * omega)
             
-            do_flip = cp.zeros(n_comps, dtype=cp.int8)
+            # Cast for float math
+            scores = cluster_votes.astype(cp.float32) * omega
             
-            # Positive votes
-            do_flip[cluster_votes > 0] = -1 # Flip (-1)
-            # Zero votes -> Random
-            zero_mask = (cluster_votes == 0)
-            n_zeros = int(cp.sum(zero_mask))
-            if n_zeros > 0:
-                rand_flips = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=n_zeros)
-                # Map back
-                # This is tricky with boolean mask assignment if sizes match
-                # cupy indexing...
-                # simpler: just fill with randoms
-                # Actually, let's just make a full random vector and mask it
-                full_rand = cp.random.choice(cp.array([1, -1], dtype=cp.int8), size=n_comps) # 1=Stay, -1=Flip? 
-                # Wait, earlier code used random choice [-1, 1] and multiplied.
-                # Here we want a multiplier. 1 = Keep, -1 = Flip.
-                
-                # Apply randoms where vote == 0
-                do_flip = cp.where(cluster_votes == 0, full_rand, do_flip)
-                
-            # Negative votes -> Keep (1)
-            do_flip = cp.where(cluster_votes < 0, 1, do_flip)
+            # Logistic function: 1 / (1 + e^-x)
+            # If vote is positive -> prob > 0.5
+            # If vote is negative -> prob < 0.5
+            # If vote is 0 -> prob = 0.5
+            probs = 1.0 / (1.0 + cp.exp(-scores))
             
-            # Ensure Positive votes are flipped (-1)
-            do_flip = cp.where(cluster_votes > 0, -1, do_flip)
+            # Random draw for each cluster (Vectorized = FAST)
+            r_vals = cp.random.random(n_comps, dtype=cp.float32)
+            
+            # -1 = Flip (if random < prob), 1 = Stay
+            do_flip = cp.where(r_vals < probs, -1, 1).astype(cp.int8)
             
             # 4. Apply
             flip_vector = do_flip[labels]
             self.sigma *= flip_vector
             
             # Ghost Invariant
-            # If Ghost was flipped (-1), we must flip EVERYONE back to keep Ghost +1
-            # But "Everyone back" means reversing the flip we just did?
-            # No, just global gauge symmetry.
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1 
         else:
@@ -661,6 +613,7 @@ for i, omega in enumerate(omega_schedule):
     if i % 20 == 0:
         # Use history arrays for printing to ensure consistency
         print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
+
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
