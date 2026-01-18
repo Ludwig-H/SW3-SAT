@@ -6,7 +6,6 @@ notebook = {
     "metadata": {
         "kernelspec": {
             "display_name": "Python 3",
-            "language": "python",
             "name": "python3"
         },
         "language_info": {
@@ -20,10 +19,15 @@ notebook = {
             "nbconvert_exporter": "python",
             "pygments_lexer": "ipython3",
             "version": "3.8.5"
-        }
+        },
+        "colab": {
+            "provenance": [],
+            "gpuType": "A100"
+        },
+        "accelerator": "GPU"
     },
     "nbformat": 4,
-    "nbformat_minor": 4
+    "nbformat_minor": 0
 }
 
 def add_markdown(source_string):
@@ -31,18 +35,24 @@ def add_markdown(source_string):
     if lines: lines[-1] = lines[-1].rstrip("\n")
     notebook["cells"].append({
         "cell_type": "markdown",
-        "metadata": {},
+        "metadata": {
+            "id": "2KtKer9gg7Il"
+        },
         "source": lines
     })
 
-def add_code(source_string):
+def add_code(source_string, execution_count=None, outputs=None):
+    if outputs is None:
+        outputs = []
     lines = [line + "\n" for line in source_string.splitlines()]
     if lines: lines[-1] = lines[-1].rstrip("\n")
     notebook["cells"].append({
         "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
+        "execution_count": execution_count,
+        "metadata": {
+            "id": "IIfZsdIYg7Iq" if "Environment" in source_string else None
+        },
+        "outputs": outputs,
         "source": lines
     })
 
@@ -58,13 +68,12 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
     *   **New**: Uses **Exact Hamiltonian Cluster Updates** (Exact Energy Delta) for decision.
-    *   **Schedule**: Logarithmic annealing (dense near $\\omega_{max}$). 
+    *   **Schedule**: Logarithmic annealing (dense near $\omega_{max}$).
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
     *   Greedy + Noise heuristic.
     *   Runs on CPU (Sequential, fast flips).
-
 """
 add_markdown(intro_text)
 
@@ -97,7 +106,16 @@ except ImportError:
 
 plt.style.use('dark_background')
 print("Environment Ready.")"""
-add_code(setup_code)
+add_code(setup_code, execution_count=1, outputs=[
+    {
+        "output_type": "stream",
+        "name": "stdout",
+        "text": [
+            "GPU Detected: 1 device(s)\n",
+            "Environment Ready.\n"
+        ]
+    }
+])
 
 # 3. Data Gen Code
 data_gen_code = """# @title 2. Data Generators (Random & SATLIB)
@@ -107,9 +125,8 @@ def generate_random_3sat(N, alpha, seed=None):
     M = int(N * alpha)
     vars = np.random.randint(1, N + 1, size=(M, 3))
     signs = np.random.choice([-1, 1], size=(M, 3))
-    return vars * signs, N
-"""
-add_code(data_gen_code)
+    return vars * signs, N"""
+add_code(data_gen_code, execution_count=2)
 
 # 4. Stochastic Solver Code
 solver_code = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
@@ -121,11 +138,11 @@ class StochasticSwendsenWangGPU:
         self.clauses = cp.array(clauses_np)
         self.GHOST = 0
         self.beta_scale = beta_scale
-        
+
         # Literals
         self.lits_idx = cp.abs(self.clauses)
         self.lits_sign = cp.sign(self.clauses)
-        
+
         # Interactions
         s = self.lits_sign
         j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
@@ -133,7 +150,7 @@ class StochasticSwendsenWangGPU:
         j20 = cp.where(s[:, 2] == s[:, 0], -1, 1)
         self.J_tri = cp.stack([j01, j12, j20], axis=1).astype(cp.int8)
         self.J_tetra = s.astype(cp.int8)
-        
+
         # State
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
@@ -150,10 +167,10 @@ class StochasticSwendsenWangGPU:
         c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.J_tetra)
         num_lit_sat = cp.sum(lit_is_sat, axis=1)
-        
+
         is_fully_sat = (num_lit_sat == 3)
         is_unsat = (num_lit_sat == 0) # High Energy / UNSAT Clause
-        
+
         # Triangle Internal Status
         s0, s1, s2 = c_spins[:, 0], c_spins[:, 1], c_spins[:, 2]
         sat0 = (s0 * s1 * self.J_tri[:, 0] == 1)
@@ -161,7 +178,7 @@ class StochasticSwendsenWangGPU:
         sat2 = (s2 * s0 * self.J_tri[:, 2] == 1)
         sat_mask = cp.stack([sat0, sat1, sat2], axis=1)
         num_sat_tri = cp.sum(sat_mask, axis=1)
-        
+
         # Low Energy Triangle = 2 satisfied edges (occurs when 1 or 2 lits sat)
         is_low_energy = (num_sat_tri == 2)
 
@@ -170,19 +187,19 @@ class StochasticSwendsenWangGPU:
         if cp.any(is_unsat):
             unsat_vars = self.lits_idx[is_unsat].flatten()
             marked_vars[unsat_vars] = True
-            
+
         lit_marked = marked_vars[self.lits_idx]
         num_marked = cp.sum(lit_marked, axis=1) # 0, 1, 2, or 3
-        
+
         # 3. Randomness
         P = 1.0 - cp.exp(-omega)
         rand_vals = cp.random.random(self.M, dtype=cp.float32)
-        
+
         src_nodes = []
         dst_nodes = []
-        
+
         # --- Tetra & Triangle Logic (Swendsen-Wang Edges) ---
-        
+
         # --- A. Tetrahedron Logic (Fully SAT) ---
         mask_A = is_fully_sat & (rand_vals < P)
         if cp.any(mask_A):
@@ -212,7 +229,7 @@ class StochasticSwendsenWangGPU:
         if cp.any(mask_B):
             idx_B = cp.where(mask_B)[0]
             n_marked_B = num_marked[idx_B]
-            
+
             # Case B3
             mask_B3 = (n_marked_B == 3)
             if cp.any(mask_B3):
@@ -324,11 +341,11 @@ class StochasticSwendsenWangGPU:
         if len(src_nodes) > 0:
             all_src = cp.concatenate(src_nodes)
             all_dst = cp.concatenate(dst_nodes)
-            
+
             data = cp.ones(len(all_src), dtype=cp.float32)
             adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
             n_comps, labels = cpx_graph.connected_components(adj, directed=False)
-            
+
             # Percolation Stats
             comp_sizes = cp.bincount(labels)
             sorted_sizes = cp.sort(comp_sizes)[::-1]
@@ -336,52 +353,52 @@ class StochasticSwendsenWangGPU:
             c2_size = sorted_sizes[1] if n_comps > 1 else 0.0
             c1_frac = c1_size / float(self.N + 1)
             c2_frac = c2_size / float(self.N + 1)
-            
+
             # --- EXACT HAMILTONIAN CLUSTER UPDATE ---
             cluster_votes = cp.zeros(n_comps, dtype=cp.int32)
-            
+
             lit_clusters = labels[self.lits_idx] # (M, 3)
             is_clause_sat_curr = cp.any(lit_is_sat, axis=1)
-            
+
             # Loop over columns (literals) to simulate flip
             for col in range(3):
                 target_clusters = lit_clusters[:, col]
-                
+
                 # Check for duplicates with previous cols
                 is_duplicate = cp.zeros(self.M, dtype=bool)
                 for prev_col in range(col):
                     is_duplicate |= (lit_clusters[:, prev_col] == target_clusters)
-                
+
                 mask_process = ~is_duplicate
                 if not cp.any(mask_process):
                     continue
-                    
+
                 mask_in_cluster = (lit_clusters == target_clusters[:, None]) # (M, 3)
                 new_lit_sat = lit_is_sat.copy()
                 new_lit_sat[mask_in_cluster] = ~new_lit_sat[mask_in_cluster]
-                
+
                 is_clause_sat_new = cp.any(new_lit_sat, axis=1)
                 delta = is_clause_sat_new.astype(cp.int32) - is_clause_sat_curr.astype(cp.int32)
-                
+
                 valid_indices = cp.where(mask_process)[0]
                 valid_clusters = target_clusters[valid_indices]
                 valid_deltas = delta[valid_indices]
-                
+
                 cp.add.at(cluster_votes, valid_clusters, valid_deltas)
 
             # 3. Decision (Logistic)
             scores = cluster_votes.astype(cp.float32) * omega * self.beta_scale
             probs = 1.0 / (1.0 + cp.exp(-scores))
-            
+
             r_vals = cp.random.random(n_comps, dtype=cp.float32)
             do_flip = cp.where(r_vals < probs, -1, 1).astype(cp.int8)
-            
+
             # 4. Apply
             flip_vector = do_flip[labels]
             self.sigma *= flip_vector
-            
+
             if self.sigma[self.GHOST] == -1:
-                self.sigma *= -1 
+                self.sigma *= -1
         else:
             c1_frac = 1.0 / (self.N + 1)
             c2_frac = 1.0 / (self.N + 1)
@@ -389,10 +406,9 @@ class StochasticSwendsenWangGPU:
             self.sigma *= flips
             if self.sigma[self.GHOST] == -1:
                 self.sigma *= -1
-            
-        return self.energy_check(omega), c1_frac, c2_frac
-"""
-add_code(solver_code)
+
+        return self.energy_check(omega), c1_frac, c2_frac"""
+add_code(solver_code, execution_count=3)
 
 # 5. WalkSAT (CPU Reference)
 baseline_code = """# @title 4. Baseline: `WalkSAT` (CPU Optimized)
@@ -401,13 +417,13 @@ class WalkSAT:
         self.N = N
         self.clauses = clauses_np # NumPy (CPU)
         self.M = len(clauses_np)
-        
+
         # Precompute lookups for break-count (simplification: simple evaluation)
         self.vars_in_clauses = [[] for _ in range(N + 1)]
         for m, clause in enumerate(self.clauses):
             for lit in clause:
                 self.vars_in_clauses[abs(lit)].append(m)
-                
+
         # Random init
         self.sigma = np.random.choice([-1, 1], size=N+1)
         self.sigma[0] = 1
@@ -417,7 +433,7 @@ class WalkSAT:
         # lit > 0: sat if sigma[lit] == 1
         # lit < 0: sat if sigma[abs(lit)] == -1
         # lit * sigma[abs(lit)] > 0
-        
+
         # Vectorized check
         lits = self.clauses
         # Get spins
@@ -431,20 +447,20 @@ class WalkSAT:
         # Perform `flips` number of flips
         # Standard WalkSAT parameters: p = 0.5 (noise)
         p = 0.5
-        
+
         unsat_indices, energy = self.evaluate()
         if len(unsat_indices) == 0:
             return 0.0 # Solved
-            
+
         for _ in range(flips):
             # Pick random unsat clause
             if len(unsat_indices) == 0: break
-            
+
             # Simple random selection
             clause_idx = np.random.choice(unsat_indices)
             clause = self.clauses[clause_idx]
             vars_in_clause = np.abs(clause)
-            
+
             # Decide: Random or Greedy?
             if np.random.random() < p:
                 # Random variable in clause
@@ -454,21 +470,21 @@ class WalkSAT:
                 # "If I flip v, how many currently satisfied clauses become unsatisfied?"
                 best_break = float('inf')
                 target = vars_in_clause[0]
-                
+
                 # To be fast, we only check clauses containing these variables
                 for v in vars_in_clause:
                     break_count = 0
                     # Check clauses containing v
                     # This loop is the bottleneck in Python.
                     # For N=500, simple check is okay.
-                    
+
                     # Flip v temporarily
                     self.sigma[v] *= -1
-                    
+
                     # Check clauses that contain v
                     # Ideally we have a list of clauses for v
                     affected_clauses = self.vars_in_clauses[v]
-                    
+
                     # For these clauses, are they now UNSAT?
                     # (We only care if they WAS SAT and NOW UNSAT)
                     # Re-evaluating them is safest
@@ -476,10 +492,10 @@ class WalkSAT:
                         c = self.clauses[c_idx]
                         if not np.any((c * self.sigma[np.abs(c)]) > 0):
                             break_count += 1
-                            
+
                     # Restore
                     self.sigma[v] *= -1
-                    
+
                     if break_count < best_break:
                         best_break = break_count
                         target = v
@@ -487,14 +503,14 @@ class WalkSAT:
                         # Tie-breaking
                         if np.random.random() < 0.5:
                             target = v
-            
+
             # Flip chosen target
             self.sigma[target] *= -1
-            
+
             # Re-eval full unsat list periodically or locally update?
             # For simplicity in this demo, we re-eval full list every flip is too slow?
             # No, for comparison curve, we run K flips then measure.
-            
+
             # We don't update unsat_indices inside this tight loop for speed,
             # we just accept we might pick a now-satisfied clause if we don't update?
             # Standard WalkSAT updates the state.
@@ -502,33 +518,33 @@ class WalkSAT:
             # We rely on the fact that we pick from the list we had.
             # But flipping fixes some and breaks others.
             # Valid WalkSAT implementation requires updating logic.
-            
+
             # Let's trust the "Batch" approach:
             # We assume we just do 1 flip properly per call to this function?
             # No, user wants performance comparison.
             # Let's do a simplified noise step: Just pick random UNSAT and flip random var.
             # This is "Random Walk" (pure noise), weaker than WalkSAT but faster to code.
             # Real WalkSAT is greedy.
-            
+
             pass # (Logic moved to loop below)
 
         # Re-run proper logic for the batch
         # We will implement a simplified version: Random Walk on UNSAT variables (GSAT-like)
         # Or just 1 Greedy flip.
-        
+
         # Let's do 1 Greedy Flip per 'step' call, but call it N times in the loop?
         # No, too slow overhead.
-        
+
         # Proper Python implementation is hard to make fast.
         # Let's return the energy after doing `flips` random valid moves.
-        
+
         current_unsat, _ = self.evaluate()
         if len(current_unsat) == 0: return 0.0
-        
+
         # Fast "ProbSAT" style:
         # Pick clause -> Pick var based on make/break distribution
         # Here: Pure Random Walk (Noise=1.0) is a baseline.
-        
+
         target_clause = np.random.choice(current_unsat)
         vars_c = np.abs(self.clauses[target_clause])
         # Heuristic: Pick var that appears in fewest other satisfied clauses?
@@ -536,16 +552,15 @@ class WalkSAT:
         # This is surprisingly effective for Random 3-SAT.
         v_flip = np.random.choice(vars_c)
         self.sigma[v_flip] *= -1
-        
+
         _, e = self.evaluate()
-        return e
-"""
-add_code(baseline_code)
+        return e"""
+add_code(baseline_code, execution_count=4)
 
 # 6. Main Loop
 main_code = r"""# @title 5. Main Simulation Loop
 N = 10000
-alpha = 4.25
+alpha = 4 # 4.25
 clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
@@ -554,13 +569,13 @@ solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 1000
-omega_min = 0.25
+omega_min = 0.0
 omega_max = 2.0
 
 # Logarithmic schedule dense towards omega_max
 # We use a geometric decay from 1 to epsilon, then map it to [min, max]
 # such that the small steps (density) happen near omega_max.
-epsilon = 1e-2 
+epsilon = 1e-2
 raw_decay = np.geomspace(1, epsilon, steps)
 decay_01 = (raw_decay - epsilon) / (1.0 - epsilon)
 omega_schedule = omega_max - (omega_max - omega_min) * decay_01
@@ -577,29 +592,29 @@ print("Starting Comparison...")
 for i, omega in enumerate(omega_schedule):
     # Stochastic SW Step
     unsat_sw, c1_val, c2_val = solver.step(omega)
-    
+
     # Store values safely (handle cupy/numpy types)
     if hasattr(unsat_sw, 'get'): history_sw.append(float(unsat_sw.get()))
     else: history_sw.append(float(unsat_sw))
-    
+
     if hasattr(c1_val, 'get'): history_c1.append(float(c1_val.get()))
     else: history_c1.append(float(c1_val))
-    
+
     if hasattr(c2_val, 'get'): history_c2.append(float(c2_val.get()))
     else: history_c2.append(float(c2_val))
-    
+
     # WalkSAT Steps (Equivalent Effort)
     # 1 SW Step ~ Global. Let's give WalkSAT N flips per step.
     # N = 500 flips.
-    flips_per_step = N//10
+    flips_per_step = N//10000
     # We run N fast flips
     e_ws = 1.0
     for _ in range(flips_per_step):
         e_ws = walksat.step(flips=1)
         if e_ws == 0.0: break
-    
+
     history_ws.append(e_ws)
-    
+
     if i % 20 == 0:
         # Use history arrays for printing to ensure consistency
         print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
@@ -619,7 +634,7 @@ ax1 = plt.gca()
 # Energy Axis
 l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW (GPU)', color='cyan', linewidth=2)
 l2, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT (CPU, N flips/step)', color='red', alpha=0.6)
-ax1.set_xlabel(r'Coupling $\\omega$ (Time)')
+ax1.set_xlabel(r'Coupling $\omega$ (Time)')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
 ax1.grid(True, alpha=0.2)
@@ -636,9 +651,18 @@ labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc='center right')
 
 plt.title(f'Stochastic SW vs WalkSAT (N={N}, Alpha={alpha})')
-plt.show()
-"""
-add_code(main_code)
+plt.show()"""
+add_code(main_code, execution_count=None, outputs=[
+    {
+        "output_type": "stream",
+        "name": "stdout",
+        "text": [
+            "Instance: N=10000, M=40000, Alpha=4\n",
+            "Starting Comparison...\n",
+            "Step   0 | Omega 0.000 | SW Unsat: 0.1226 (C1=0.0001, C2=0.0001) | WS Unsat: 0.1240\n"
+        ]
+    }
+])
 
 with open("Swendsen-Wang_3SAT_Colab.ipynb", "w", encoding="utf-8") as f:
     json.dump(notebook, f, indent=1)
