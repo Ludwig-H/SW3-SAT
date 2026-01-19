@@ -552,51 +552,82 @@ class SwendsenWangGlauberGPU:
 
         # --- 2. DYNAMICS (Metropolis/Glauber on Clusters) ---
         
+        # Optimization: Build Sparse Lookup Tables (CSR)
+        # 1. Cluster -> Variables
+        # This allows O(1) retrieval of all variables in a cluster
+        # sort_indices = cp.argsort(labels) # Not strictly needed for CSR but good for order
+        # We use a sparse matrix where rows=cluster_id, cols=var_idx
+        data_v = cp.ones(self.N + 1, dtype=cp.bool_)
+        cluster_to_vars = cpx.coo_matrix(
+            (data_v, (labels, cp.arange(self.N + 1))), 
+            shape=(n_comps, self.N + 1)
+        ).tocsr()
+
+        # 2. Cluster -> Clauses
+        # lit_clusters is (M, 3). We want to map ClusterID -> ClauseIDs
+        # Flatten to coordinate format
+        flat_clusters = lit_clusters.flatten()
+        flat_clauses = cp.repeat(cp.arange(self.M), 3)
+        data_c = cp.ones(len(flat_clusters), dtype=cp.bool_)
+        
+        # Note: A clause might be listed multiple times for the same cluster if multiple lits are in it.
+        # CSR conversion sums duplicates by default, or we can treat as boolean presence.
+        cluster_to_clauses = cpx.coo_matrix(
+            (data_c, (flat_clusters, flat_clauses)), 
+            shape=(n_comps, self.M)
+        ).tocsr()
+
         ghost_label = labels[0]
         unique_labels = cp.unique(labels)
-        # Exclude ghost cluster from candidates
         valid_clusters = unique_labels[unique_labels != ghost_label]
         num_valid = len(valid_clusters)
 
         if num_valid > 0:
-            # Pre-generate random choices for the loop
             target_indices = cp.random.randint(0, num_valid, size=self.steps_flips)
             chosen_clusters = valid_clusters[target_indices]
-            
-            # Pre-generate acceptance random numbers
             r_accepts = cp.random.random(self.steps_flips, dtype=cp.float32)
 
-            # Map literals to clusters for fast lookup
-            lit_clusters = labels[self.lits_idx] # (M, 3)
-            
             # Loop for dynamics
             for i in range(self.steps_flips):
                 c_id = chosen_clusters[i]
                 
-                # Identify relevant clauses: those containing at least one variable in c_id
-                mask_clauses = cp.any(lit_clusters == c_id, axis=1)
+                # --- FAST LOOKUP ---
+                # Get relevant clause indices directly from CSR
+                start_ptr_c = cluster_to_clauses.indptr[c_id]
+                end_ptr_c = cluster_to_clauses.indptr[c_id+1]
                 
-                if not cp.any(mask_clauses):
+                if start_ptr_c == end_ptr_c:
+                    # Cluster not connected to any clause (isolated vars)
+                    # Just flip vars, Delta E is 0
+                    start_ptr_v = cluster_to_vars.indptr[c_id]
+                    end_ptr_v = cluster_to_vars.indptr[c_id+1]
+                    vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
+                    self.sigma[vars_idx] *= -1
                     continue
 
-                # Subset of clauses to check
-                sub_lits_idx = self.lits_idx[mask_clauses]
-                sub_lits_sign = self.lits_sign[mask_clauses]
-                sub_sigma = self.sigma[sub_lits_idx]
+                clause_idx = cluster_to_clauses.indices[start_ptr_c:end_ptr_c]
+
+                # Subset of clauses
+                sub_lits_idx = self.lits_idx[clause_idx]
+                sub_lits_sign = self.lits_sign[clause_idx]
+                sub_sigma = self.sigma[sub_lits_idx] # Gather sigma values
                 
                 # Current Satisfaction
                 is_sat_curr = cp.any(sub_sigma == sub_lits_sign, axis=1)
                 
-                # Proposed Satisfaction (Flip vars in c_id)
-                sub_lits_clusters = lit_clusters[mask_clauses]
-                mask_in_cluster = (sub_lits_clusters == c_id)
+                # Proposed Satisfaction
+                # We need to flip ONLY the variables belonging to c_id.
+                # Which literals in these clauses belong to c_id?
+                # We can re-check the cluster map locally
+                sub_lit_clusters = lit_clusters[clause_idx]
+                mask_in_cluster = (sub_lit_clusters == c_id)
                 
                 proposed_sigma = sub_sigma.copy()
                 proposed_sigma[mask_in_cluster] *= -1
                 
                 is_sat_new = cp.any(proposed_sigma == sub_lits_sign, axis=1)
                 
-                # Delta E = New_Unsat - Curr_Unsat
+                # Delta E
                 unsat_curr = cp.sum(~is_sat_curr)
                 unsat_new = cp.sum(~is_sat_new)
                 delta_E = unsat_new - unsat_curr 
@@ -615,8 +646,12 @@ class SwendsenWangGlauberGPU:
                         accept = True
                 
                 if accept:
-                    # Apply flip efficiently
-                    self.sigma[labels == c_id] *= -1
+                    # FAST UPDATE: Get variables from CSR
+                    start_ptr_v = cluster_to_vars.indptr[c_id]
+                    end_ptr_v = cluster_to_vars.indptr[c_id+1]
+                    vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
+                    
+                    self.sigma[vars_idx] *= -1
 
         return self.energy_check(), c1_frac, c2_frac"""
 add_code(glauber_solver_code, execution_count=None)
