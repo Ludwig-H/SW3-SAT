@@ -602,46 +602,50 @@ class SwendsenWangGlauberGPU:
             chosen_clusters = valid_clusters[target_indices]
             r_accepts = cp.random.random(self.steps_flips, dtype=cp.float32)
 
+            # Lazy Update Vector: Keep track of cluster flips without writing to main memory yet
+            cluster_flips = cp.ones(n_comps, dtype=cp.int8)
+
             # Loop for dynamics
             for i in range(self.steps_flips):
                 c_id = chosen_clusters[i]
                 
                 # --- FAST LOOKUP ---
                 # Get relevant clause indices directly from CSR
-                # Convert to int explicitly for slicing (avoids CuPy scalar issues)
                 start_ptr_c = int(cluster_to_clauses.indptr[c_id])
                 end_ptr_c = int(cluster_to_clauses.indptr[c_id+1])
                 
+                # If isolated cluster, just flip the state bit (fast update)
                 if start_ptr_c == end_ptr_c:
-                    # Cluster not connected to any clause (isolated vars)
-                    # Just flip vars, Delta E is 0
-                    start_ptr_v = int(cluster_to_vars.indptr[c_id])
-                    end_ptr_v = int(cluster_to_vars.indptr[c_id+1])
-                    vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
-                    self.sigma[vars_idx] *= -1
+                    cluster_flips[c_id] *= -1
                     continue
 
                 clause_idx = cluster_to_clauses.indices[start_ptr_c:end_ptr_c]
 
-                # Subset of clauses
-                sub_lits_idx = self.lits_idx[clause_idx]
+                # Subset of clauses data
                 sub_lits_sign = self.lits_sign[clause_idx]
-                sub_sigma = self.sigma[sub_lits_idx] # Gather sigma values
+                sub_sigma = self.sigma[self.lits_idx[clause_idx]] # Initial sigma (frozen)
                 
-                # Current Satisfaction
-                is_sat_curr = cp.any(sub_sigma == sub_lits_sign, axis=1)
-                
-                # Proposed Satisfaction
-                # We need to flip ONLY the variables belonging to c_id.
-                # Which literals in these clauses belong to c_id?
-                # We can re-check the cluster map locally
+                # Which clusters own these literals?
                 sub_lit_clusters = lit_clusters[clause_idx]
-                mask_in_cluster = (sub_lit_clusters == c_id)
                 
-                proposed_sigma = sub_sigma.copy()
-                proposed_sigma[mask_in_cluster] *= -1
+                # CURRENT STATE:
+                # Effective sigma = Initial_Sigma * Flip_State_of_Cluster
+                # We need the flip state of ALL clusters involved in these clauses, not just c_id
+                current_cluster_flips = cluster_flips[sub_lit_clusters]
                 
-                is_sat_new = cp.any(proposed_sigma == sub_lits_sign, axis=1)
+                effective_sigma = sub_sigma * current_cluster_flips
+                is_sat_curr = cp.any(effective_sigma == sub_lits_sign, axis=1)
+                
+                # PROPOSED STATE:
+                # We flip ONLY the component corresponding to c_id in the current_cluster_flips
+                mask_target = (sub_lit_clusters == c_id)
+                
+                # Apply flip locally to the vector we just gathered
+                proposed_cluster_flips = current_cluster_flips.copy()
+                proposed_cluster_flips[mask_target] *= -1
+                
+                proposed_sigma_eff = sub_sigma * proposed_cluster_flips
+                is_sat_new = cp.any(proposed_sigma_eff == sub_lits_sign, axis=1)
                 
                 # Delta E
                 unsat_curr = cp.sum(~is_sat_curr)
@@ -662,12 +666,16 @@ class SwendsenWangGlauberGPU:
                         accept = True
                 
                 if accept:
-                    # FAST UPDATE: Get variables from CSR
-                    start_ptr_v = int(cluster_to_vars.indptr[c_id])
-                    end_ptr_v = int(cluster_to_vars.indptr[c_id+1])
-                    vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
-                    
-                    self.sigma[vars_idx] *= -1
+                    # SUPER FAST UPDATE: Just flip the bit in the vector
+                    cluster_flips[c_id] *= -1
+
+            # --- FINALIZE: Apply lazy flips to global memory ---
+            # Map cluster flips back to variables
+            # self.sigma *= cluster_flips[labels]
+            # Since labels is size N+1, we can broadcast
+            self.sigma *= cluster_flips[labels]
+
+        return self.energy_check(), c1_frac, c2_frac
 
         return self.energy_check(), c1_frac, c2_frac"""
 add_code(glauber_solver_code, execution_count=None)
