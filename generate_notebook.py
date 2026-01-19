@@ -410,6 +410,196 @@ class StochasticSwendsenWangGPU:
         return self.energy_check(omega), c1_frac, c2_frac"""
 add_code(solver_code, execution_count=3)
 
+# 4b. New Solver: SwendsenWangGlauberGPU
+glauber_solver_code = r"""# @title 3b. The New Solver: `SwendsenWangGlauberGPU`
+
+class SwendsenWangGlauberGPU:
+    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=1000, dynamics="Metropolis-Hastings"):
+        self.N = N
+        self.M = len(clauses_np)
+        self.clauses = cp.array(clauses_np)
+        self.GHOST = 0
+        self.beta_scale = beta_scale
+        self.steps_flips = steps_flips
+        self.dynamics = dynamics  # "Metropolis-Hastings" or "Glauber"
+
+        # Literals info
+        self.lits_idx = cp.abs(self.clauses)
+        self.lits_sign = cp.sign(self.clauses).astype(cp.int8)
+
+        # Triangle Interactions (J_tri)
+        # We implicitly consider the clause as a triangle of interactions between literals.
+        # Edge (0,1), (1,2), (2,0).
+        s = self.lits_sign
+        j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
+        j12 = cp.where(s[:, 1] == s[:, 2], -1, 1)
+        j20 = cp.where(s[:, 2] == s[:, 0], -1, 1)
+        self.J_tri = cp.stack([j01, j12, j20], axis=1).astype(cp.int8)
+
+        # State (Ghost at index 0 is always 1)
+        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
+        self.sigma[0] = 1
+
+    def energy_check(self):
+        spins = self.sigma[self.lits_idx]
+        is_lit_sat = (spins == self.lits_sign)
+        is_clause_sat = cp.any(is_lit_sat, axis=1)
+        return 1.0 - cp.mean(is_clause_sat)
+
+    def step(self, omega):
+        # --- 1. CLUSTERING STEP (Swendsen-Wang) ---
+        
+        # A. Calculate Status
+        c_spins = self.sigma[self.lits_idx]
+        lit_is_sat = (c_spins == self.lits_sign)
+        num_lit_sat = cp.sum(lit_is_sat, axis=1)
+
+        # Clauses fully satisfied (3 literals satisfied)
+        is_fully_sat = (num_lit_sat == 3) 
+        
+        # Triangle Status (Edges satisfied)
+        s0, s1, s2 = c_spins[:, 0], c_spins[:, 1], c_spins[:, 2]
+        sat0 = (s0 * s1 * self.J_tri[:, 0] == 1)
+        sat1 = (s1 * s2 * self.J_tri[:, 1] == 1)
+        sat2 = (s2 * s0 * self.J_tri[:, 2] == 1)
+        sat_mask = cp.stack([sat0, sat1, sat2], axis=1)
+        num_sat_tri = cp.sum(sat_mask, axis=1)
+        
+        # Low Energy Triangles (Exactly 2 edges satisfied)
+        is_low_energy = (num_sat_tri == 2)
+
+        # B. Generate Edges
+        P = 1.0 - cp.exp(-omega)
+        rand_vals = cp.random.random(self.M, dtype=cp.float32)
+        
+        src_nodes = []
+        dst_nodes = []
+
+        # --- B1. Ghost Connections (Fully SAT Clauses) ---
+        # If freeze: pick ONE literal randomly and connect to Ghost (0)
+        mask_G = is_fully_sat & (rand_vals < P)
+        if cp.any(mask_G):
+            idx_G = cp.where(mask_G)[0]
+            # Pick one of 0, 1, 2 randomly
+            r_col = cp.random.randint(0, 3, size=len(idx_G))
+            # Get the literal index at that column
+            targets = self.lits_idx[idx_G, r_col]
+            
+            src_nodes.append(cp.zeros_like(targets)) # Connect to Ghost (0)
+            dst_nodes.append(targets)
+
+        # --- B2. Internal Edges (Low Energy Triangles) ---
+        # If freeze: pick ONE of the TWO satisfied edges randomly
+        mask_T = is_low_energy & (rand_vals < P)
+        if cp.any(mask_T):
+            idx_T = cp.where(mask_T)[0]
+            # Identify the two satisfied edges for each clause [sat0, sat1, sat2]
+            sub_sat_mask = sat_mask[idx_T] # Shape (K, 3), sum is 2 per row
+            
+            # Select one edge randomly among the satisfied ones
+            r_noise = cp.random.random(sub_sat_mask.shape, dtype=cp.float32)
+            # Mask out unsatisfied edges (already false, but for safety) so they aren't picked
+            chosen_edge_idx = cp.argmax(sub_sat_mask * r_noise, axis=1)
+            
+            lits = self.lits_idx[idx_T]
+            l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
+            
+            # edge 0: (l0, l1), edge 1: (l1, l2), edge 2: (l2, l0)
+            s_e = cp.where(chosen_edge_idx==0, l0, cp.where(chosen_edge_idx==1, l1, l2))
+            d_e = cp.where(chosen_edge_idx==0, l1, cp.where(chosen_edge_idx==1, l2, l0))
+            
+            src_nodes.append(s_e)
+            dst_nodes.append(d_e)
+
+        # C. Connected Components
+        if len(src_nodes) > 0:
+            all_src = cp.concatenate(src_nodes)
+            all_dst = cp.concatenate(dst_nodes)
+            data = cp.ones(len(all_src), dtype=cp.float32)
+            # Ensure size is N+1
+            adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
+            n_comps, labels = cpx_graph.connected_components(adj, directed=False)
+        else:
+            n_comps = self.N + 1
+            labels = cp.arange(self.N + 1, dtype=cp.int32)
+
+        # Stats
+        comp_sizes = cp.bincount(labels)
+        sorted_sizes = cp.sort(comp_sizes)[::-1]
+        c1_frac = sorted_sizes[0] / (self.N + 1)
+        c2_frac = sorted_sizes[1] / (self.N + 1) if n_comps > 1 else 0.0
+
+        # --- 2. DYNAMICS (Metropolis/Glauber on Clusters) ---
+        
+        ghost_label = labels[0]
+        unique_labels = cp.unique(labels)
+        # Exclude ghost cluster from candidates
+        valid_clusters = unique_labels[unique_labels != ghost_label]
+        num_valid = len(valid_clusters)
+
+        if num_valid > 0:
+            # Pre-generate random choices for the loop
+            target_indices = cp.random.randint(0, num_valid, size=self.steps_flips)
+            chosen_clusters = valid_clusters[target_indices]
+            
+            # Pre-generate acceptance random numbers
+            r_accepts = cp.random.random(self.steps_flips, dtype=cp.float32)
+
+            # Map literals to clusters for fast lookup
+            lit_clusters = labels[self.lits_idx] # (M, 3)
+            
+            # Loop for dynamics
+            for i in range(self.steps_flips):
+                c_id = chosen_clusters[i]
+                
+                # Identify relevant clauses: those containing at least one variable in c_id
+                mask_clauses = cp.any(lit_clusters == c_id, axis=1)
+                
+                if not cp.any(mask_clauses):
+                    continue
+
+                # Subset of clauses to check
+                sub_lits_idx = self.lits_idx[mask_clauses]
+                sub_lits_sign = self.lits_sign[mask_clauses]
+                sub_sigma = self.sigma[sub_lits_idx]
+                
+                # Current Satisfaction
+                is_sat_curr = cp.any(sub_sigma == sub_lits_sign, axis=1)
+                
+                # Proposed Satisfaction (Flip vars in c_id)
+                sub_lits_clusters = lit_clusters[mask_clauses]
+                mask_in_cluster = (sub_lits_clusters == c_id)
+                
+                proposed_sigma = sub_sigma.copy()
+                proposed_sigma[mask_in_cluster] *= -1
+                
+                is_sat_new = cp.any(proposed_sigma == sub_lits_sign, axis=1)
+                
+                # Delta E = New_Unsat - Curr_Unsat
+                unsat_curr = cp.sum(~is_sat_curr)
+                unsat_new = cp.sum(~is_sat_new)
+                delta_E = unsat_new - unsat_curr 
+                
+                accept = False
+                if self.dynamics == "Metropolis-Hastings":
+                    if delta_E <= 0:
+                        accept = True
+                    else:
+                        prob = cp.exp(-delta_E * omega * self.beta_scale)
+                        if r_accepts[i] < prob:
+                            accept = True
+                elif self.dynamics == "Glauber":
+                    prob = 1.0 / (1.0 + cp.exp(delta_E * omega * self.beta_scale))
+                    if r_accepts[i] < prob:
+                        accept = True
+                
+                if accept:
+                    # Apply flip efficiently
+                    self.sigma[labels == c_id] *= -1
+
+        return self.energy_check(), c1_frac, c2_frac"""
+add_code(glauber_solver_code, execution_count=None)
+
 # 5. WalkSAT (CPU Reference)
 baseline_code = """# @title 4. Baseline: `WalkSAT` (CPU Optimized)
 class WalkSAT:
@@ -564,36 +754,34 @@ alpha = 4 # 4.25
 clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
-# Use the New Solver
+# Solvers
 solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
+solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=10.0, steps_flips=1000)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 1000
 omega_min = 0.0
 omega_max = 2.0
 
-# Logarithmic schedule dense towards omega_max
-# We use a geometric decay from 1 to epsilon, then map it to [min, max]
-# such that the small steps (density) happen near omega_max.
 epsilon = 1e-2
 raw_decay = np.geomspace(1, epsilon, steps)
 decay_01 = (raw_decay - epsilon) / (1.0 - epsilon)
 omega_schedule = omega_max - (omega_max - omega_min) * decay_01
 
-# Init history arrays explicitely
+# History
 history_sw = []
 history_c1 = []
 history_c2 = []
+history_gl = [] # Glauber
 history_ws = []
 
 t0 = time.time()
 print("Starting Comparison...")
 
 for i, omega in enumerate(omega_schedule):
-    # Stochastic SW Step
+    # 1. Stochastic SW (Original)
     unsat_sw, c1_val, c2_val = solver.step(omega)
-
-    # Store values safely (handle cupy/numpy types)
+    
     if hasattr(unsat_sw, 'get'): history_sw.append(float(unsat_sw.get()))
     else: history_sw.append(float(unsat_sw))
 
@@ -603,11 +791,15 @@ for i, omega in enumerate(omega_schedule):
     if hasattr(c2_val, 'get'): history_c2.append(float(c2_val.get()))
     else: history_c2.append(float(c2_val))
 
-    # WalkSAT Steps (Equivalent Effort)
-    # 1 SW Step ~ Global. Let's give WalkSAT N flips per step.
-    # N = 500 flips.
+    # 2. SW Glauber (New)
+    unsat_gl, _, _ = solver_gl.step(omega)
+    if hasattr(unsat_gl, 'get'): history_gl.append(float(unsat_gl.get()))
+    else: history_gl.append(float(unsat_gl))
+
+    # 3. WalkSAT
     flips_per_step = N//10000
-    # We run N fast flips
+    if flips_per_step < 1: flips_per_step = 1
+    
     e_ws = 1.0
     for _ in range(flips_per_step):
         e_ws = walksat.step(flips=1)
@@ -616,8 +808,7 @@ for i, omega in enumerate(omega_schedule):
     history_ws.append(e_ws)
 
     if i % 20 == 0:
-        # Use history arrays for printing to ensure consistency
-        print(f"Step {i:3d} | Omega {omega:.3f} | SW Unsat: {unsat_sw:.4f} (C1={history_c1[-1]:.4f}, C2={history_c2[-1]:.4f}) | WS Unsat: {e_ws:.4f}")
+        print(f"Step {i:3d} | Omega {omega:.3f} | SW: {unsat_sw:.4f} | GL: {unsat_gl:.4f} | WS: {e_ws:.4f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
@@ -625,6 +816,7 @@ print(f"Done in {dt:.2f}s")
 # Plot
 omega_cpu = omega_schedule
 sw_cpu = np.array(history_sw)
+gl_cpu = np.array(history_gl)
 ws_cpu = np.array(history_ws)
 c1_cpu = np.array(history_c1)
 
@@ -632,8 +824,10 @@ plt.figure(figsize=(12, 7))
 ax1 = plt.gca()
 
 # Energy Axis
-l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW (GPU)', color='cyan', linewidth=2)
-l2, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT (CPU, N flips/step)', color='red', alpha=0.6)
+l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW (Exact)', color='cyan', linewidth=2)
+l2, = ax1.plot(omega_cpu, gl_cpu, label='SW + Glauber', color='lime', linewidth=2, linestyle='-')
+l3, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT', color='red', alpha=0.6)
+
 ax1.set_xlabel(r'Coupling $\omega$ (Time)')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
@@ -641,16 +835,16 @@ ax1.grid(True, alpha=0.2)
 
 # Cluster Axis
 ax2 = ax1.twinx()
-l3, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (SW)', color='magenta', linestyle='--', linewidth=1.5)
+l4, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (SW)', color='magenta', linestyle='--', linewidth=1.5)
 ax2.set_ylabel('Cluster Size Fraction', color='white')
 ax2.tick_params(axis='y', labelcolor='white')
 
 # Legend
-lines = [l1, l2, l3]
+lines = [l1, l2, l3, l4]
 labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc='center right')
 
-plt.title(f'Stochastic SW vs WalkSAT (N={N}, Alpha={alpha})')
+plt.title(f'Solver Comparison (N={N}, Alpha={alpha})')
 plt.show()"""
 add_code(main_code, execution_count=None, outputs=[
     {
