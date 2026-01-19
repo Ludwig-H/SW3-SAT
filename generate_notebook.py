@@ -581,15 +581,17 @@ class SwendsenWangGlauberGPU:
         src_nodes = []
         dst_nodes = []
 
-        # B1. Ghost
+        # --- B1. Ghost Connections (Fully SAT Clauses) ---
+        # If freeze: connect ALL THREE literals to Ghost (0)
         mask_G = is_fully_sat & (rand_vals < P)
         if cp.any(mask_G):
             idx_G = cp.where(mask_G)[0]
-            r_vals_G = rand_vals[idx_G]
-            P_3 = P / 3.0
-            col_choice = (r_vals_G >= P_3).astype(cp.int8) + (r_vals_G >= 2 * P_3).astype(cp.int8)
-            targets = self.lits_idx[idx_G, col_choice]
-            src_nodes.append(cp.zeros_like(targets)) 
+            
+            # We want to connect lits 0, 1, and 2 of these clauses to Ghost.
+            # Get all literals for these clauses: shape (K, 3) -> flatten to (3K,)
+            targets = self.lits_idx[idx_G].flatten()
+            
+            src_nodes.append(cp.zeros_like(targets)) # Connect to Ghost (0)
             dst_nodes.append(targets)
 
         # B2. Internal
