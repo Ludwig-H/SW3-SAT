@@ -476,30 +476,51 @@ class SwendsenWangGlauberGPU:
         dst_nodes = []
 
         # --- B1. Ghost Connections (Fully SAT Clauses) ---
-        # If freeze: pick ONE literal randomly and connect to Ghost (0)
+        # If freeze: pick ONE literal randomly based on rand_vals segments [0, P/3), [P/3, 2P/3), [2P/3, P)
         mask_G = is_fully_sat & (rand_vals < P)
         if cp.any(mask_G):
             idx_G = cp.where(mask_G)[0]
-            # Pick one of 0, 1, 2 randomly
-            r_col = cp.random.randint(0, 3, size=len(idx_G))
-            # Get the literal index at that column
-            targets = self.lits_idx[idx_G, r_col]
+            r_vals_G = rand_vals[idx_G]
+            
+            # Determine column 0, 1, or 2 based on where r_vals_G falls in [0, P]
+            # Thresholds
+            P_3 = P / 3.0
+            
+            # col = 0 if r < P/3, 1 if P/3 <= r < 2P/3, 2 if r >= 2P/3
+            # Use sum of comparisons for branchless selection
+            col_choice = (r_vals_G >= P_3).astype(cp.int8) + (r_vals_G >= 2 * P_3).astype(cp.int8)
+            
+            targets = self.lits_idx[idx_G, col_choice]
             
             src_nodes.append(cp.zeros_like(targets)) # Connect to Ghost (0)
             dst_nodes.append(targets)
 
         # --- B2. Internal Edges (Low Energy Triangles) ---
-        # If freeze: pick ONE of the TWO satisfied edges randomly
+        # If freeze: pick ONE of the TWO satisfied edges based on rand_vals segments [0, P/2), [P/2, P)
         mask_T = is_low_energy & (rand_vals < P)
         if cp.any(mask_T):
             idx_T = cp.where(mask_T)[0]
-            # Identify the two satisfied edges for each clause [sat0, sat1, sat2]
-            sub_sat_mask = sat_mask[idx_T] # Shape (K, 3), sum is 2 per row
+            r_vals_T = rand_vals[idx_T]
             
-            # Select one edge randomly among the satisfied ones
-            r_noise = cp.random.random(sub_sat_mask.shape, dtype=cp.float32)
-            # Mask out unsatisfied edges (already false, but for safety) so they aren't picked
-            chosen_edge_idx = cp.argmax(sub_sat_mask * r_noise, axis=1)
+            # Identify the two satisfied edges. 
+            # sat_mask[idx_T] has exactly two Trues per row.
+            sub_sat = sat_mask[idx_T]
+            
+            # Find index of the first True (0, 1, or 2)
+            idx_1st = cp.argmax(sub_sat, axis=1)
+            
+            # Find index of the second True. 
+            # Sum of indices (0+1=1, 0+2=2, 1+2=3). 
+            # The sum of all satisfied indices is sum(sub_sat * [0,1,2]).
+            # So 2nd index = Total_Sum - 1st_Index.
+            idx_sum = cp.sum(sub_sat * cp.array([0, 1, 2], dtype=cp.int8), axis=1)
+            idx_2nd = idx_sum - idx_1st
+            
+            # Selection: First edge if r < P/2, else Second edge
+            P_2 = P / 2.0
+            pick_first = (r_vals_T < P_2)
+            
+            chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
             
             lits = self.lits_idx[idx_T]
             l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
