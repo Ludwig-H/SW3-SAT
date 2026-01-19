@@ -844,7 +844,11 @@ omega_schedule = omega_max - (omega_max - omega_min) * decay_01
 history_sw = []
 history_c1 = []
 history_c2 = []
+
 history_gl = [] # Glauber
+history_gl_c1 = []
+history_gl_c2 = []
+
 history_ws = []
 
 t0 = time.time()
@@ -864,9 +868,16 @@ for i, omega in enumerate(omega_schedule):
     else: history_c2.append(float(c2_val))
 
     # 2. SW Glauber (New)
-    unsat_gl, _, _ = solver_gl.step(omega)
+    unsat_gl, c1_gl, c2_gl = solver_gl.step(omega)
+    
     if hasattr(unsat_gl, 'get'): history_gl.append(float(unsat_gl.get()))
     else: history_gl.append(float(unsat_gl))
+    
+    if hasattr(c1_gl, 'get'): history_gl_c1.append(float(c1_gl.get()))
+    else: history_gl_c1.append(float(c1_gl))
+
+    if hasattr(c2_gl, 'get'): history_gl_c2.append(float(c2_gl.get()))
+    else: history_gl_c2.append(float(c2_gl))
 
     # 3. WalkSAT
     flips_per_step = N//10000
@@ -880,7 +891,7 @@ for i, omega in enumerate(omega_schedule):
     history_ws.append(e_ws)
 
     if i % 20 == 0:
-        print(f"Step {i:3d} | Omega {omega:.3f} | SW: {unsat_sw:.4f} | GL: {unsat_gl:.4f} | WS: {e_ws:.4f}")
+        print(f"Step {i:3d} | Omega {omega:.3f} | SW: {unsat_sw:.4f} (C1={history_c1[-1]:.2f}) | GL: {unsat_gl:.4f} (C1={history_gl_c1[-1]:.2f}) | WS: {e_ws:.4f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
@@ -891,6 +902,7 @@ sw_cpu = np.array(history_sw)
 gl_cpu = np.array(history_gl)
 ws_cpu = np.array(history_ws)
 c1_cpu = np.array(history_c1)
+c1_gl_cpu = np.array(history_gl_c1)
 
 plt.figure(figsize=(12, 7))
 ax1 = plt.gca()
@@ -908,11 +920,13 @@ ax1.grid(True, alpha=0.2)
 # Cluster Axis
 ax2 = ax1.twinx()
 l4, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (SW)', color='magenta', linestyle='--', linewidth=1.5)
+l5, = ax2.plot(omega_cpu, c1_gl_cpu, label='Largest Cluster (GL)', color='green', linestyle=':', linewidth=2.0)
+
 ax2.set_ylabel('Cluster Size Fraction', color='white')
 ax2.tick_params(axis='y', labelcolor='white')
 
 # Legend
-lines = [l1, l2, l3, l4]
+lines = [l1, l2, l3, l4, l5]
 labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc='center right')
 
