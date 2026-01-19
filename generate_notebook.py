@@ -552,7 +552,7 @@ class SwendsenWangGlauberGPU:
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
         
-        self.kernel = cp.RawKernel(glauber_kernel_code, 'run_glauber_dynamics')
+        self.kernel = cp.RawKernel(glauber_kernel_code, 'run_glauber_dynamics', options=('-std=c++17',))
 
     def energy_check(self):
         spins = self.sigma[self.lits_idx]
@@ -851,7 +851,7 @@ walksat = WalkSAT(clauses_np, N)
 
 steps = 1000
 omega_min = 0.0
-omega_max = 2.0
+omega_max = 0.5
 
 epsilon = 1e-2
 raw_decay = np.geomspace(1, epsilon, steps)
