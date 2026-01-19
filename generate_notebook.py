@@ -552,6 +552,9 @@ class SwendsenWangGlauberGPU:
 
         # --- 2. DYNAMICS (Metropolis/Glauber on Clusters) ---
         
+        # Define lit_clusters needed for CSR construction
+        lit_clusters = labels[self.lits_idx] # (M, 3)
+
         # Optimization: Build Sparse Lookup Tables (CSR)
         # 1. Cluster -> Variables
         # This allows O(1) retrieval of all variables in a cluster
