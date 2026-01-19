@@ -415,9 +415,9 @@ glauber_solver_code = r"""# @title 3b. The New Solver: `SwendsenWangGlauberGPU` 
 
 # CUDA Kernel for Glauber Dynamics
 glauber_kernel_code = r'''
-extern "C" {
-    #include <curand_kernel.h>
+#include <curand_kernel.h>
 
+extern "C" {
     __global__ void run_glauber_dynamics(
         signed char* sigma,           // N+1
         const int* c2c_indptr,        // n_comps + 1
