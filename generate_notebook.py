@@ -417,115 +417,113 @@ glauber_solver_code = r"""# @title 3b. The New Solver: `SwendsenWangGlauberGPU` 
 glauber_kernel_code = r'''
 #include <curand_kernel.h>
 
-extern "C" {
-    __global__ void run_glauber_dynamics(
-        signed char* sigma,           // N+1
-        const int* c2c_indptr,        // n_comps + 1
-        const int* c2c_indices,       // n_clauses_refs
-        const int* c2v_indptr,        // n_comps + 1
-        const int* c2v_indices,       // n_vars_refs
-        const int* lits_idx,          // M * 3
-        const signed char* lits_sign, // M * 3
-        const int* lit_clusters,      // M * 3
-        const int* valid_clusters,    // num_valid
-        int num_valid,
-        int steps,
-        float omega,
-        float beta_scale,
-        unsigned long long seed
-    ) {
-        // Shared memory for reduction and communication
-        __shared__ int delta_E_shared;
-        __shared__ int decision_shared; // 0=reject, 1=accept
-        __shared__ int target_cluster_shared;
+extern "C" __global__ void run_glauber_dynamics(
+    signed char* sigma,           // N+1
+    const int* c2c_indptr,        // n_comps + 1
+    const int* c2c_indices,       // n_clauses_refs
+    const int* c2v_indptr,        // n_comps + 1
+    const int* c2v_indices,       // n_vars_refs
+    const int* lits_idx,          // M * 3
+    const signed char* lits_sign, // M * 3
+    const int* lit_clusters,      // M * 3
+    const int* valid_clusters,    // num_valid
+    int num_valid,
+    int steps,
+    float omega,
+    float beta_scale,
+    unsigned long long seed
+) {
+    // Shared memory for reduction and communication
+    __shared__ int delta_E_shared;
+    __shared__ int decision_shared; // 0=reject, 1=accept
+    __shared__ int target_cluster_shared;
 
-        // Initialize RNG
-        curandState state;
+    // Initialize RNG
+    curandState state;
+    if (threadIdx.x == 0) {
+        curand_init(seed, 0, 0, &state);
+    }
+
+    for (int step = 0; step < steps; step++) {
+        __syncthreads();
+        
+        // --- 1. Pick Target Cluster ---
         if (threadIdx.x == 0) {
-            curand_init(seed, 0, 0, &state);
+            delta_E_shared = 0;
+            decision_shared = 0;
+            unsigned int r = curand(&state);
+            int r_idx = r % num_valid; 
+            target_cluster_shared = valid_clusters[r_idx];
         }
+        __syncthreads();
 
-        for (int step = 0; step < steps; step++) {
-            __syncthreads();
-            
-            // --- 1. Pick Target Cluster ---
-            if (threadIdx.x == 0) {
-                delta_E_shared = 0;
-                decision_shared = 0;
-                unsigned int r = curand(&state);
-                int r_idx = r % num_valid; 
-                target_cluster_shared = valid_clusters[r_idx];
-            }
-            __syncthreads();
+        int c_id = target_cluster_shared;
+        int start_c = c2c_indptr[c_id];
+        int end_c = c2c_indptr[c_id+1];
+        
+        // --- 2. Compute Delta E (Parallel over clauses) ---
+        if (start_c < end_c) {
+            for (int i = start_c + threadIdx.x; i < end_c; i += blockDim.x) {
+                int clause_idx = c2c_indices[i];
+                
+                int idx0 = clause_idx * 3 + 0;
+                int idx1 = clause_idx * 3 + 1;
+                int idx2 = clause_idx * 3 + 2;
 
-            int c_id = target_cluster_shared;
-            int start_c = c2c_indptr[c_id];
-            int end_c = c2c_indptr[c_id+1];
-            
-            // --- 2. Compute Delta E (Parallel over clauses) ---
-            if (start_c < end_c) {
-                for (int i = start_c + threadIdx.x; i < end_c; i += blockDim.x) {
-                    int clause_idx = c2c_indices[i];
-                    
-                    int idx0 = clause_idx * 3 + 0;
-                    int idx1 = clause_idx * 3 + 1;
-                    int idx2 = clause_idx * 3 + 2;
+                int l0 = lits_idx[idx0];
+                int l1 = lits_idx[idx1];
+                int l2 = lits_idx[idx2];
+                
+                signed char s0 = lits_sign[idx0];
+                signed char s1 = lits_sign[idx1];
+                signed char s2 = lits_sign[idx2];
+                
+                signed char sig0 = sigma[l0];
+                signed char sig1 = sigma[l1];
+                signed char sig2 = sigma[l2];
+                
+                int cl0 = lit_clusters[idx0];
+                int cl1 = lit_clusters[idx1];
+                int cl2 = lit_clusters[idx2];
 
-                    int l0 = lits_idx[idx0];
-                    int l1 = lits_idx[idx1];
-                    int l2 = lits_idx[idx2];
-                    
-                    signed char s0 = lits_sign[idx0];
-                    signed char s1 = lits_sign[idx1];
-                    signed char s2 = lits_sign[idx2];
-                    
-                    signed char sig0 = sigma[l0];
-                    signed char sig1 = sigma[l1];
-                    signed char sig2 = sigma[l2];
-                    
-                    int cl0 = lit_clusters[idx0];
-                    int cl1 = lit_clusters[idx1];
-                    int cl2 = lit_clusters[idx2];
+                bool sat_curr = (sig0 == s0) || (sig1 == s1) || (sig2 == s2);
 
-                    bool sat_curr = (sig0 == s0) || (sig1 == s1) || (sig2 == s2);
+                signed char p_sig0 = (cl0 == c_id) ? -sig0 : sig0;
+                signed char p_sig1 = (cl1 == c_id) ? -sig1 : sig1;
+                signed char p_sig2 = (cl2 == c_id) ? -sig2 : sig2;
 
-                    signed char p_sig0 = (cl0 == c_id) ? -sig0 : sig0;
-                    signed char p_sig1 = (cl1 == c_id) ? -sig1 : sig1;
-                    signed char p_sig2 = (cl2 == c_id) ? -sig2 : sig2;
+                bool sat_new = (p_sig0 == s0) || (p_sig1 == s1) || (p_sig2 == s2);
 
-                    bool sat_new = (p_sig0 == s0) || (p_sig1 == s1) || (p_sig2 == s2);
-
-                    if (sat_curr != sat_new) {
-                        int local_delta = (int)sat_curr - (int)sat_new;
-                        atomicAdd(&delta_E_shared, local_delta);
-                    }
+                if (sat_curr != sat_new) {
+                    int local_delta = (int)sat_curr - (int)sat_new;
+                    atomicAdd(&delta_E_shared, local_delta);
                 }
             }
-            __syncthreads();
+        }
+        __syncthreads();
 
-            // --- 3. Decision ---
-            if (threadIdx.x == 0) {
-                int dE = delta_E_shared;
-                if (dE <= 0) {
+        // --- 3. Decision ---
+        if (threadIdx.x == 0) {
+            int dE = delta_E_shared;
+            if (dE <= 0) {
+                decision_shared = 1;
+            } else {
+                float p = expf(-(float)dE * omega * beta_scale);
+                float r = curand_uniform(&state);
+                if (r < p) {
                     decision_shared = 1;
-                } else {
-                    float p = expf(-(float)dE * omega * beta_scale);
-                    float r = curand_uniform(&state);
-                    if (r < p) {
-                        decision_shared = 1;
-                    }
                 }
             }
-            __syncthreads();
+        }
+        __syncthreads();
 
-            // --- 4. Update Sigma ---
-            if (decision_shared) {
-                int start_v = c2v_indptr[c_id];
-                int end_v = c2v_indptr[c_id+1];
-                for (int i = start_v + threadIdx.x; i < end_v; i += blockDim.x) {
-                    int var_idx = c2v_indices[i];
-                    sigma[var_idx] *= -1;
-                }
+        // --- 4. Update Sigma ---
+        if (decision_shared) {
+            int start_v = c2v_indptr[c_id];
+            int end_v = c2v_indptr[c_id+1];
+            for (int i = start_v + threadIdx.x; i < end_v; i += blockDim.x) {
+                int var_idx = c2v_indices[i];
+                sigma[var_idx] *= -1;
             }
         }
     }
