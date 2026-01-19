@@ -568,12 +568,24 @@ class SwendsenWangGlauberGPU:
         # Flatten to coordinate format
         flat_clusters = lit_clusters.flatten()
         flat_clauses = cp.repeat(cp.arange(self.M), 3)
-        data_c = cp.ones(len(flat_clusters), dtype=cp.bool_)
         
-        # Note: A clause might be listed multiple times for the same cluster if multiple lits are in it.
-        # CSR conversion sums duplicates by default, or we can treat as boolean presence.
+        # CRITICAL FIX: Ensure (Cluster, Clause) pairs are unique.
+        # Although CSR usually sums duplicates, explicit uniqueness ensures logic clarity 
+        # and avoids any ambiguity about weights.
+        # Optimization: Use 1D unique on combined keys (faster than axis=0).
+        # Key = ClusterID * M + ClauseID. 
+        # Max Key ~ 10000 * 40000 = 4*10^8 (fits in int32/int64)
+        
+        combined_keys = flat_clusters.astype(cp.int64) * self.M + flat_clauses.astype(cp.int64)
+        unique_keys = cp.unique(combined_keys)
+        
+        u_clusters = (unique_keys // self.M).astype(cp.int32)
+        u_clauses = (unique_keys % self.M).astype(cp.int32)
+        
+        data_c = cp.ones(len(u_clusters), dtype=cp.bool_)
+        
         cluster_to_clauses = cpx.coo_matrix(
-            (data_c, (flat_clusters, flat_clauses)), 
+            (data_c, (u_clusters, u_clauses)), 
             shape=(n_comps, self.M)
         ).tocsr()
 
@@ -593,14 +605,15 @@ class SwendsenWangGlauberGPU:
                 
                 # --- FAST LOOKUP ---
                 # Get relevant clause indices directly from CSR
-                start_ptr_c = cluster_to_clauses.indptr[c_id]
-                end_ptr_c = cluster_to_clauses.indptr[c_id+1]
+                # Convert to int explicitly for slicing (avoids CuPy scalar issues)
+                start_ptr_c = int(cluster_to_clauses.indptr[c_id])
+                end_ptr_c = int(cluster_to_clauses.indptr[c_id+1])
                 
                 if start_ptr_c == end_ptr_c:
                     # Cluster not connected to any clause (isolated vars)
                     # Just flip vars, Delta E is 0
-                    start_ptr_v = cluster_to_vars.indptr[c_id]
-                    end_ptr_v = cluster_to_vars.indptr[c_id+1]
+                    start_ptr_v = int(cluster_to_vars.indptr[c_id])
+                    end_ptr_v = int(cluster_to_vars.indptr[c_id+1])
                     vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
                     self.sigma[vars_idx] *= -1
                     continue
@@ -647,8 +660,8 @@ class SwendsenWangGlauberGPU:
                 
                 if accept:
                     # FAST UPDATE: Get variables from CSR
-                    start_ptr_v = cluster_to_vars.indptr[c_id]
-                    end_ptr_v = cluster_to_vars.indptr[c_id+1]
+                    start_ptr_v = int(cluster_to_vars.indptr[c_id])
+                    end_ptr_v = int(cluster_to_vars.indptr[c_id+1])
                     vars_idx = cluster_to_vars.indices[start_ptr_v:end_ptr_v]
                     
                     self.sigma[vars_idx] *= -1
