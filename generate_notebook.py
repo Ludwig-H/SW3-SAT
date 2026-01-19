@@ -411,7 +411,126 @@ class StochasticSwendsenWangGPU:
 add_code(solver_code, execution_count=3)
 
 # 4b. New Solver: SwendsenWangGlauberGPU
-glauber_solver_code = r"""# @title 3b. The New Solver: `SwendsenWangGlauberGPU`
+glauber_solver_code = r"""# @title 3b. The New Solver: `SwendsenWangGlauberGPU` (Optimized Kernel)
+
+# CUDA Kernel for Glauber Dynamics
+glauber_kernel_code = r'''
+extern "C" {
+    #include <curand_kernel.h>
+
+    __global__ void run_glauber_dynamics(
+        signed char* sigma,           // N+1
+        const int* c2c_indptr,        // n_comps + 1
+        const int* c2c_indices,       // n_clauses_refs
+        const int* c2v_indptr,        // n_comps + 1
+        const int* c2v_indices,       // n_vars_refs
+        const int* lits_idx,          // M * 3
+        const signed char* lits_sign, // M * 3
+        const int* lit_clusters,      // M * 3
+        const int* valid_clusters,    // num_valid
+        int num_valid,
+        int steps,
+        float omega,
+        float beta_scale,
+        unsigned long long seed
+    ) {
+        // Shared memory for reduction and communication
+        __shared__ int delta_E_shared;
+        __shared__ int decision_shared; // 0=reject, 1=accept
+        __shared__ int target_cluster_shared;
+
+        // Initialize RNG
+        curandState state;
+        if (threadIdx.x == 0) {
+            curand_init(seed, 0, 0, &state);
+        }
+
+        for (int step = 0; step < steps; step++) {
+            __syncthreads();
+            
+            // --- 1. Pick Target Cluster ---
+            if (threadIdx.x == 0) {
+                delta_E_shared = 0;
+                decision_shared = 0;
+                unsigned int r = curand(&state);
+                int r_idx = r % num_valid; 
+                target_cluster_shared = valid_clusters[r_idx];
+            }
+            __syncthreads();
+
+            int c_id = target_cluster_shared;
+            int start_c = c2c_indptr[c_id];
+            int end_c = c2c_indptr[c_id+1];
+            
+            // --- 2. Compute Delta E (Parallel over clauses) ---
+            if (start_c < end_c) {
+                for (int i = start_c + threadIdx.x; i < end_c; i += blockDim.x) {
+                    int clause_idx = c2c_indices[i];
+                    
+                    int idx0 = clause_idx * 3 + 0;
+                    int idx1 = clause_idx * 3 + 1;
+                    int idx2 = clause_idx * 3 + 2;
+
+                    int l0 = lits_idx[idx0];
+                    int l1 = lits_idx[idx1];
+                    int l2 = lits_idx[idx2];
+                    
+                    signed char s0 = lits_sign[idx0];
+                    signed char s1 = lits_sign[idx1];
+                    signed char s2 = lits_sign[idx2];
+                    
+                    signed char sig0 = sigma[l0];
+                    signed char sig1 = sigma[l1];
+                    signed char sig2 = sigma[l2];
+                    
+                    int cl0 = lit_clusters[idx0];
+                    int cl1 = lit_clusters[idx1];
+                    int cl2 = lit_clusters[idx2];
+
+                    bool sat_curr = (sig0 == s0) || (sig1 == s1) || (sig2 == s2);
+
+                    signed char p_sig0 = (cl0 == c_id) ? -sig0 : sig0;
+                    signed char p_sig1 = (cl1 == c_id) ? -sig1 : sig1;
+                    signed char p_sig2 = (cl2 == c_id) ? -sig2 : sig2;
+
+                    bool sat_new = (p_sig0 == s0) || (p_sig1 == s1) || (p_sig2 == s2);
+
+                    if (sat_curr != sat_new) {
+                        int local_delta = (int)sat_curr - (int)sat_new;
+                        atomicAdd(&delta_E_shared, local_delta);
+                    }
+                }
+            }
+            __syncthreads();
+
+            // --- 3. Decision ---
+            if (threadIdx.x == 0) {
+                int dE = delta_E_shared;
+                if (dE <= 0) {
+                    decision_shared = 1;
+                } else {
+                    float p = expf(-(float)dE * omega * beta_scale);
+                    float r = curand_uniform(&state);
+                    if (r < p) {
+                        decision_shared = 1;
+                    }
+                }
+            }
+            __syncthreads();
+
+            // --- 4. Update Sigma ---
+            if (decision_shared) {
+                int start_v = c2v_indptr[c_id];
+                int end_v = c2v_indptr[c_id+1];
+                for (int i = start_v + threadIdx.x; i < end_v; i += blockDim.x) {
+                    int var_idx = c2v_indices[i];
+                    sigma[var_idx] *= -1;
+                }
+            }
+        }
+    }
+}
+'''
 
 class SwendsenWangGlauberGPU:
     def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=1000, dynamics="Metropolis-Hastings"):
@@ -421,24 +540,21 @@ class SwendsenWangGlauberGPU:
         self.GHOST = 0
         self.beta_scale = beta_scale
         self.steps_flips = steps_flips
-        self.dynamics = dynamics  # "Metropolis-Hastings" or "Glauber"
+        self.dynamics = dynamics 
 
-        # Literals info
-        self.lits_idx = cp.abs(self.clauses)
+        self.lits_idx = cp.abs(self.clauses).astype(cp.int32)
         self.lits_sign = cp.sign(self.clauses).astype(cp.int8)
 
-        # Triangle Interactions (J_tri)
-        # We implicitly consider the clause as a triangle of interactions between literals.
-        # Edge (0,1), (1,2), (2,0).
         s = self.lits_sign
         j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
         j12 = cp.where(s[:, 1] == s[:, 2], -1, 1)
         j20 = cp.where(s[:, 2] == s[:, 0], -1, 1)
         self.J_tri = cp.stack([j01, j12, j20], axis=1).astype(cp.int8)
 
-        # State (Ghost at index 0 is always 1)
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
+        
+        self.kernel = cp.RawKernel(glauber_kernel_code, 'run_glauber_dynamics')
 
     def energy_check(self):
         spins = self.sigma[self.lits_idx]
@@ -447,97 +563,61 @@ class SwendsenWangGlauberGPU:
         return 1.0 - cp.mean(is_clause_sat)
 
     def step(self, omega):
-        # --- 1. CLUSTERING STEP (Swendsen-Wang) ---
-        
-        # A. Calculate Status
+        # --- 1. CLUSTERING ---
         c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.lits_sign)
         num_lit_sat = cp.sum(lit_is_sat, axis=1)
-
-        # Clauses fully satisfied (3 literals satisfied)
         is_fully_sat = (num_lit_sat == 3) 
         
-        # Triangle Status (Edges satisfied)
         s0, s1, s2 = c_spins[:, 0], c_spins[:, 1], c_spins[:, 2]
         sat0 = (s0 * s1 * self.J_tri[:, 0] == 1)
         sat1 = (s1 * s2 * self.J_tri[:, 1] == 1)
         sat2 = (s2 * s0 * self.J_tri[:, 2] == 1)
         sat_mask = cp.stack([sat0, sat1, sat2], axis=1)
         num_sat_tri = cp.sum(sat_mask, axis=1)
-        
-        # Low Energy Triangles (Exactly 2 edges satisfied)
         is_low_energy = (num_sat_tri == 2)
 
-        # B. Generate Edges
         P = 1.0 - cp.exp(-omega)
         rand_vals = cp.random.random(self.M, dtype=cp.float32)
         
         src_nodes = []
         dst_nodes = []
 
-        # --- B1. Ghost Connections (Fully SAT Clauses) ---
-        # If freeze: pick ONE literal randomly based on rand_vals segments [0, P/3), [P/3, 2P/3), [2P/3, P)
+        # B1. Ghost
         mask_G = is_fully_sat & (rand_vals < P)
         if cp.any(mask_G):
             idx_G = cp.where(mask_G)[0]
             r_vals_G = rand_vals[idx_G]
-            
-            # Determine column 0, 1, or 2 based on where r_vals_G falls in [0, P]
-            # Thresholds
             P_3 = P / 3.0
-            
-            # col = 0 if r < P/3, 1 if P/3 <= r < 2P/3, 2 if r >= 2P/3
-            # Use sum of comparisons for branchless selection
             col_choice = (r_vals_G >= P_3).astype(cp.int8) + (r_vals_G >= 2 * P_3).astype(cp.int8)
-            
             targets = self.lits_idx[idx_G, col_choice]
-            
-            src_nodes.append(cp.zeros_like(targets)) # Connect to Ghost (0)
+            src_nodes.append(cp.zeros_like(targets)) 
             dst_nodes.append(targets)
 
-        # --- B2. Internal Edges (Low Energy Triangles) ---
-        # If freeze: pick ONE of the TWO satisfied edges based on rand_vals segments [0, P/2), [P/2, P)
+        # B2. Internal
         mask_T = is_low_energy & (rand_vals < P)
         if cp.any(mask_T):
             idx_T = cp.where(mask_T)[0]
             r_vals_T = rand_vals[idx_T]
-            
-            # Identify the two satisfied edges. 
-            # sat_mask[idx_T] has exactly two Trues per row.
             sub_sat = sat_mask[idx_T]
-            
-            # Find index of the first True (0, 1, or 2)
             idx_1st = cp.argmax(sub_sat, axis=1)
-            
-            # Find index of the second True. 
-            # Sum of indices (0+1=1, 0+2=2, 1+2=3). 
-            # The sum of all satisfied indices is sum(sub_sat * [0,1,2]).
-            # So 2nd index = Total_Sum - 1st_Index.
             idx_sum = cp.sum(sub_sat * cp.array([0, 1, 2], dtype=cp.int8), axis=1)
             idx_2nd = idx_sum - idx_1st
-            
-            # Selection: First edge if r < P/2, else Second edge
             P_2 = P / 2.0
             pick_first = (r_vals_T < P_2)
-            
             chosen_edge_idx = cp.where(pick_first, idx_1st, idx_2nd)
-            
             lits = self.lits_idx[idx_T]
             l0, l1, l2 = lits[:,0], lits[:,1], lits[:,2]
-            
-            # edge 0: (l0, l1), edge 1: (l1, l2), edge 2: (l2, l0)
             s_e = cp.where(chosen_edge_idx==0, l0, cp.where(chosen_edge_idx==1, l1, l2))
             d_e = cp.where(chosen_edge_idx==0, l1, cp.where(chosen_edge_idx==1, l2, l0))
-            
             src_nodes.append(s_e)
             dst_nodes.append(d_e)
 
-        # C. Connected Components
+        # Connected Components
         if len(src_nodes) > 0:
             all_src = cp.concatenate(src_nodes)
             all_dst = cp.concatenate(dst_nodes)
             data = cp.ones(len(all_src), dtype=cp.float32)
-            # Ensure size is N+1
             adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
             n_comps, labels = cpx_graph.connected_components(adj, directed=False)
         else:
@@ -550,41 +630,23 @@ class SwendsenWangGlauberGPU:
         c1_frac = sorted_sizes[0] / (self.N + 1)
         c2_frac = sorted_sizes[1] / (self.N + 1) if n_comps > 1 else 0.0
 
-        # --- 2. DYNAMICS (Metropolis/Glauber on Clusters) ---
-        
-        # Define lit_clusters needed for CSR construction
+        # --- 2. DYNAMICS (KERNEL) ---
         lit_clusters = labels[self.lits_idx] # (M, 3)
 
-        # Optimization: Build Sparse Lookup Tables (CSR)
-        # 1. Cluster -> Variables
-        # This allows O(1) retrieval of all variables in a cluster
-        # sort_indices = cp.argsort(labels) # Not strictly needed for CSR but good for order
-        # We use a sparse matrix where rows=cluster_id, cols=var_idx
+        # CSR: Cluster -> Vars
         data_v = cp.ones(self.N + 1, dtype=cp.bool_)
         cluster_to_vars = cpx.coo_matrix(
             (data_v, (labels, cp.arange(self.N + 1))), 
             shape=(n_comps, self.N + 1)
         ).tocsr()
 
-        # 2. Cluster -> Clauses
-        # lit_clusters is (M, 3). We want to map ClusterID -> ClauseIDs
-        # Flatten to coordinate format
+        # CSR: Cluster -> Clauses
         flat_clusters = lit_clusters.flatten()
         flat_clauses = cp.repeat(cp.arange(self.M), 3)
-        
-        # CRITICAL FIX: Ensure (Cluster, Clause) pairs are unique.
-        # Although CSR usually sums duplicates, explicit uniqueness ensures logic clarity 
-        # and avoids any ambiguity about weights.
-        # Optimization: Use 1D unique on combined keys (faster than axis=0).
-        # Key = ClusterID * M + ClauseID. 
-        # Max Key ~ 10000 * 40000 = 4*10^8 (fits in int32/int64)
-        
         combined_keys = flat_clusters.astype(cp.int64) * self.M + flat_clauses.astype(cp.int64)
         unique_keys = cp.unique(combined_keys)
-        
         u_clusters = (unique_keys // self.M).astype(cp.int32)
         u_clauses = (unique_keys % self.M).astype(cp.int32)
-        
         data_c = cp.ones(len(u_clusters), dtype=cp.bool_)
         
         cluster_to_clauses = cpx.coo_matrix(
@@ -592,90 +654,40 @@ class SwendsenWangGlauberGPU:
             shape=(n_comps, self.M)
         ).tocsr()
 
+        # Valid Clusters
         ghost_label = labels[0]
         unique_labels = cp.unique(labels)
-        valid_clusters = unique_labels[unique_labels != ghost_label]
+        valid_clusters = unique_labels[unique_labels != ghost_label].astype(cp.int32)
         num_valid = len(valid_clusters)
 
         if num_valid > 0:
-            target_indices = cp.random.randint(0, num_valid, size=self.steps_flips)
-            chosen_clusters = valid_clusters[target_indices]
-            r_accepts = cp.random.random(self.steps_flips, dtype=cp.float32)
-
-            # Lazy Update Vector: Keep track of cluster flips without writing to main memory yet
-            cluster_flips = cp.ones(n_comps, dtype=cp.int8)
-
-            # Loop for dynamics
-            for i in range(self.steps_flips):
-                c_id = chosen_clusters[i]
-                
-                # --- FAST LOOKUP ---
-                # Get relevant clause indices directly from CSR
-                start_ptr_c = int(cluster_to_clauses.indptr[c_id])
-                end_ptr_c = int(cluster_to_clauses.indptr[c_id+1])
-                
-                # If isolated cluster, just flip the state bit (fast update)
-                if start_ptr_c == end_ptr_c:
-                    cluster_flips[c_id] *= -1
-                    continue
-
-                clause_idx = cluster_to_clauses.indices[start_ptr_c:end_ptr_c]
-
-                # Subset of clauses data
-                sub_lits_sign = self.lits_sign[clause_idx]
-                sub_sigma = self.sigma[self.lits_idx[clause_idx]] # Initial sigma (frozen)
-                
-                # Which clusters own these literals?
-                sub_lit_clusters = lit_clusters[clause_idx]
-                
-                # CURRENT STATE:
-                # Effective sigma = Initial_Sigma * Flip_State_of_Cluster
-                # We need the flip state of ALL clusters involved in these clauses, not just c_id
-                current_cluster_flips = cluster_flips[sub_lit_clusters]
-                
-                effective_sigma = sub_sigma * current_cluster_flips
-                is_sat_curr = cp.any(effective_sigma == sub_lits_sign, axis=1)
-                
-                # PROPOSED STATE:
-                # We flip ONLY the component corresponding to c_id in the current_cluster_flips
-                mask_target = (sub_lit_clusters == c_id)
-                
-                # Apply flip locally to the vector we just gathered
-                proposed_cluster_flips = current_cluster_flips.copy()
-                proposed_cluster_flips[mask_target] *= -1
-                
-                proposed_sigma_eff = sub_sigma * proposed_cluster_flips
-                is_sat_new = cp.any(proposed_sigma_eff == sub_lits_sign, axis=1)
-                
-                # Delta E
-                unsat_curr = cp.sum(~is_sat_curr)
-                unsat_new = cp.sum(~is_sat_new)
-                delta_E = unsat_new - unsat_curr 
-                
-                accept = False
-                if self.dynamics == "Metropolis-Hastings":
-                    if delta_E <= 0:
-                        accept = True
-                    else:
-                        prob = cp.exp(-delta_E * omega * self.beta_scale)
-                        if r_accepts[i] < prob:
-                            accept = True
-                elif self.dynamics == "Glauber":
-                    prob = 1.0 / (1.0 + cp.exp(delta_E * omega * self.beta_scale))
-                    if r_accepts[i] < prob:
-                        accept = True
-                
-                if accept:
-                    # SUPER FAST UPDATE: Just flip the bit in the vector
-                    cluster_flips[c_id] *= -1
-
-            # --- FINALIZE: Apply lazy flips to global memory ---
-            # Map cluster flips back to variables
-            # self.sigma *= cluster_flips[labels]
-            # Since labels is size N+1, we can broadcast
-            self.sigma *= cluster_flips[labels]
-
-        return self.energy_check(), c1_frac, c2_frac
+            c2c_indptr = cluster_to_clauses.indptr.astype(cp.int32)
+            c2c_indices = cluster_to_clauses.indices.astype(cp.int32)
+            c2v_indptr = cluster_to_vars.indptr.astype(cp.int32)
+            c2v_indices = cluster_to_vars.indices.astype(cp.int32)
+            
+            lits_idx_ptr = self.lits_idx.astype(cp.int32)
+            lits_sign_ptr = self.lits_sign
+            lit_clusters_ptr = lit_clusters.astype(cp.int32)
+            
+            seed = int(time.time() * 1000) % 1000000007
+            
+            self.kernel(
+                (1,), (256,),
+                (
+                    self.sigma,
+                    c2c_indptr, c2c_indices,
+                    c2v_indptr, c2v_indices,
+                    lits_idx_ptr, lits_sign_ptr,
+                    lit_clusters_ptr,
+                    valid_clusters,
+                    cp.int32(num_valid),
+                    cp.int32(self.steps_flips),
+                    cp.float32(omega),
+                    cp.float32(self.beta_scale),
+                    cp.uint64(seed)
+                )
+            )
 
         return self.energy_check(), c1_frac, c2_frac"""
 add_code(glauber_solver_code, execution_count=None)
