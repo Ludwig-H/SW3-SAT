@@ -125,7 +125,7 @@ add_code(code_source_2, execution_count=2, outputs=[])
 code_source_3 = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
 
 class StochasticSwendsenWangGPU:
-    def __init__(self, clauses_np, N, beta_scale=10.0):
+    def __init__(self, clauses_np, N, beta_scale=15.0):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -524,7 +524,7 @@ extern "C" __global__ void run_glauber_dynamics(
 '''
 
 class SwendsenWangGlauberGPU:
-    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=None, dynamics="Metropolis-Hastings"):
+    def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, dynamics="Metropolis-Hastings"):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -805,7 +805,7 @@ add_code(code_source_4, execution_count=4, outputs=[])
 code_source_4b = r"""# @title 3c. The Solver: `CompleteSwendsenWangGPU`
 
 class CompleteSwendsenWangGPU:
-    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=None, dynamics="Metropolis-Hastings"):
+    def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, dynamics="Metropolis-Hastings"):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -924,6 +924,99 @@ class CompleteSwendsenWangGPU:
             seed = int(time.time() * 1000) % 1000000007
             self.kernel((1,), (256,), (self.sigma, c2c_indptr, c2c_indices, c2v_indptr, c2v_indices, self.lits_idx, self.lits_sign, lit_clusters_ptr, valid_clusters, cp.int32(num_valid), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed)))
             
+        # --- PHASE 2: UNSAT DYNAMICS (8x Boost) ---
+        c_spins = self.sigma[self.lits_idx]
+        lit_is_sat = (c_spins == self.lits_sign)
+        num_lit_sat = cp.sum(lit_is_sat, axis=1)
+        is_unsat = (num_lit_sat == 0)
+
+        if cp.any(is_unsat):
+            omega_2 = 8.0 * omega
+            P_2 = 1.0 - cp.exp(-omega_2)
+            idx_U = cp.where(is_unsat)[0]
+            n_unsat = len(idx_U)
+            r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
+            
+            src_nodes_2 = []
+            dst_nodes_2 = []
+            
+            P_7 = P_2 / 7.0
+            
+            # [6P/7, P) -> Full Freeze
+            mask_full = (r_vals_U >= 6.0 * P_7) & (r_vals_U < P_2)
+            if cp.any(mask_full):
+                sub_idx = idx_U[mask_full]
+                lits = self.lits_idx[sub_idx]
+                src_nodes_2.append(lits[:, 0])
+                dst_nodes_2.append(lits[:, 1])
+                src_nodes_2.append(lits[:, 1])
+                dst_nodes_2.append(lits[:, 2])
+
+            # [0, 2P/7) -> Edge 0
+            mask_e0 = (r_vals_U < 2.0 * P_7)
+            if cp.any(mask_e0):
+                sub_idx = idx_U[mask_e0]
+                lits = self.lits_idx[sub_idx]
+                src_nodes_2.append(lits[:, 0])
+                dst_nodes_2.append(lits[:, 1])
+
+            # [2P/7, 4P/7) -> Edge 1
+            mask_e1 = (r_vals_U >= 2.0 * P_7) & (r_vals_U < 4.0 * P_7)
+            if cp.any(mask_e1):
+                sub_idx = idx_U[mask_e1]
+                lits = self.lits_idx[sub_idx]
+                src_nodes_2.append(lits[:, 1])
+                dst_nodes_2.append(lits[:, 2])
+
+            # [4P/7, 6P/7) -> Edge 2
+            mask_e2 = (r_vals_U >= 4.0 * P_7) & (r_vals_U < 6.0 * P_7)
+            if cp.any(mask_e2):
+                sub_idx = idx_U[mask_e2]
+                lits = self.lits_idx[sub_idx]
+                src_nodes_2.append(lits[:, 2])
+                dst_nodes_2.append(lits[:, 0])
+
+            if len(src_nodes_2) > 0:
+                all_src_2 = cp.concatenate(src_nodes_2)
+                all_dst_2 = cp.concatenate(dst_nodes_2)
+                data_2 = cp.ones(len(all_src_2), dtype=cp.float32)
+                adj_2 = cpx.coo_matrix((data_2, (all_src_2, all_dst_2)), shape=(self.N+1, self.N+1), dtype=cp.float32)
+                n_comps_2, labels_2 = cpx_graph.connected_components(adj_2, directed=False)
+            else:
+                n_comps_2 = self.N + 1
+                labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
+
+            # Valid Clusters: Variables in UNSAT clauses (including singletons)
+            unsat_vars = self.lits_idx[idx_U].flatten()
+            relevant_clusters = labels_2[unsat_vars]
+            unique_relevant = cp.unique(relevant_clusters)
+            ghost_label_2 = labels_2[0]
+            valid_clusters_2 = unique_relevant[unique_relevant != ghost_label_2].astype(cp.int32)
+            num_valid_2 = len(valid_clusters_2)
+
+            if num_valid_2 > 0:
+                # Setup Kernel Phase 2
+                lit_clusters_2 = labels_2[self.lits_idx]
+                data_v_2 = cp.ones(self.N + 1, dtype=cp.bool_)
+                cluster_to_vars_2 = cpx.coo_matrix((data_v_2, (labels_2, cp.arange(self.N + 1))), shape=(n_comps_2, self.N + 1)).tocsr()
+                flat_clusters_2 = lit_clusters_2.flatten()
+                flat_clauses_2 = cp.repeat(cp.arange(self.M), 3)
+                combined_keys_2 = flat_clusters_2.astype(cp.int64) * self.M + flat_clauses_2.astype(cp.int64)
+                unique_keys_2 = cp.unique(combined_keys_2)
+                u_clusters_2 = (unique_keys_2 // self.M).astype(cp.int32)
+                u_clauses_2 = (unique_keys_2 % self.M).astype(cp.int32)
+                data_c_2 = cp.ones(len(u_clusters_2), dtype=cp.bool_)
+                cluster_to_clauses_2 = cpx.coo_matrix((data_c_2, (u_clusters_2, u_clauses_2)), shape=(n_comps_2, self.M)).tocsr()
+
+                c2c_indptr_2 = cluster_to_clauses_2.indptr.astype(cp.int32)
+                c2c_indices_2 = cluster_to_clauses_2.indices.astype(cp.int32)
+                c2v_indptr_2 = cluster_to_vars_2.indptr.astype(cp.int32)
+                c2v_indices_2 = cluster_to_vars_2.indices.astype(cp.int32)
+                lit_clusters_ptr_2 = cp.ascontiguousarray(lit_clusters_2.astype(cp.int32))
+                
+                # Reuse seed + offset
+                self.kernel((1,), (256,), (self.sigma, c2c_indptr_2, c2c_indices_2, c2v_indptr_2, c2v_indices_2, self.lits_idx, self.lits_sign, lit_clusters_ptr_2, valid_clusters_2, cp.int32(num_valid_2), cp.int32(self.steps_flips), cp.float32(omega_2), cp.float32(self.beta_scale), cp.uint64(seed + 100)))
+
         current_energy = self.energy_check()
         if current_energy < self.min_energy:
             self.min_energy = current_energy
@@ -1089,15 +1182,15 @@ clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
 # Solvers
-facteur_complete = 10
-solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
-solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
-solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=10.0 * facteur_complete, steps_flips=2*N)
+facteur_complete = 5
+solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=15.0)
+solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=15.0, steps_flips=2*N)
+solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=15.0 * facteur_complete, steps_flips=2*N)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
 omega_min = 0.1
-omega_max = 1.0
+omega_max = 0.5
 
 epsilon = 1e-2
 raw_decay = np.geomspace(1, epsilon, steps)
