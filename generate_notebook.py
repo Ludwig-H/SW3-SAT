@@ -153,6 +153,7 @@ class StochasticSwendsenWangGPU:
         return unsat_frac
 
     def step(self, omega):
+        # print("DEBUG: Executing CORRECTED StochasticSwendsenWangGPU step")
         # 1. Calculate Clause Status
         c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.J_tetra)
