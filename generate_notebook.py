@@ -705,11 +705,11 @@ class SwendsenWangGlauberGPU:
             n_unsat = len(idx_U)
             r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
             
-            P_split = P / 2.0
-            P_single = P / 6.0
+            P_7 = P / 7.0
             
             # --- FULL FREEZE (Two edges => Triangle) ---
-            mask_full = (r_vals_U >= P_split) & (r_vals_U < P)
+            # Range [6P/7, P)
+            mask_full = (r_vals_U >= 6.0 * P_7) & (r_vals_U < P)
             if cp.any(mask_full):
                 sub_idx = idx_U[mask_full]
                 lits = self.lits_idx[sub_idx]
@@ -721,22 +721,22 @@ class SwendsenWangGlauberGPU:
                 dst_nodes_2.append(lits[:, 2])
             
             # --- SINGLE EDGE FREEZE ---
-            # Edge 0 (0-1)
-            mask_e0 = (r_vals_U < P_single)
+            # Edge 0 (0-1) : [0, 2P/7)
+            mask_e0 = (r_vals_U < 2.0 * P_7)
             if cp.any(mask_e0):
                 sub_idx = idx_U[mask_e0]
                 lits = self.lits_idx[sub_idx]
                 src_nodes_2.append(lits[:, 0])
                 dst_nodes_2.append(lits[:, 1])
-            # Edge 1 (1-2)
-            mask_e1 = (r_vals_U >= P_single) & (r_vals_U < 2*P_single)
+            # Edge 1 (1-2) : [2P/7, 4P/7)
+            mask_e1 = (r_vals_U >= 2.0 * P_7) & (r_vals_U < 4.0 * P_7)
             if cp.any(mask_e1):
                 sub_idx = idx_U[mask_e1]
                 lits = self.lits_idx[sub_idx]
                 src_nodes_2.append(lits[:, 1])
                 dst_nodes_2.append(lits[:, 2])
-            # Edge 2 (2-0)
-            mask_e2 = (r_vals_U >= 2*P_single) & (r_vals_U < P_split)
+            # Edge 2 (2-0) : [4P/7, 6P/7)
+            mask_e2 = (r_vals_U >= 4.0 * P_7) & (r_vals_U < 6.0 * P_7)
             if cp.any(mask_e2):
                 sub_idx = idx_U[mask_e2]
                 lits = self.lits_idx[sub_idx]
