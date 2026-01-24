@@ -738,8 +738,8 @@ class SwendsenWangGlauberGPU:
             n_comps_2 = self.N + 1
             labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
 
+        comp_sizes_2 = cp.bincount(labels_2)
         if verbose:
-            comp_sizes_2 = cp.bincount(labels_2)
             sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
             print(f"Phase 2 Top 3 Clusters: {sorted_sizes_2[:3]}")
 
@@ -756,10 +756,11 @@ class SwendsenWangGlauberGPU:
         data_c_2 = cp.ones(len(u_clusters_2), dtype=cp.bool_)
         cluster_to_clauses_2 = cpx.coo_matrix((data_c_2, (u_clusters_2, u_clauses_2)), shape=(n_comps_2, self.M)).tocsr()
 
-        # Valid Clusters 2: ALL except Ghost
+        # Valid Clusters 2: Size > 1 AND not Ghost
         ghost_label_2 = labels_2[0]
         unique_labels_2 = cp.unique(labels_2)
-        valid_clusters_2 = unique_labels_2[unique_labels_2 != ghost_label_2].astype(cp.int32)
+        mask_valid = (comp_sizes_2[unique_labels_2] > 1) & (unique_labels_2 != ghost_label_2)
+        valid_clusters_2 = unique_labels_2[mask_valid].astype(cp.int32)
         num_valid_2 = len(valid_clusters_2)
 
         # 5. Execute Kernel Phase 2
