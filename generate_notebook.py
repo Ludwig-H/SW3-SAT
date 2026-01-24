@@ -122,7 +122,7 @@ add_code(code_source_2, execution_count=2, outputs=[])
 code_source_3 = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
 
 class StochasticSwendsenWangGPU:
-    def __init__(self, clauses_np, N, beta_scale=10.0):
+    def __init__(self, clauses_np, N, beta_scale=20.0):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -522,7 +522,7 @@ extern "C" __global__ void run_glauber_dynamics(
 '''
 
 class SwendsenWangGlauberGPU:
-    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=None, dynamics="Metropolis-Hastings"):
+    def __init__(self, clauses_np, N, beta_scale=20.0, steps_flips=None, dynamics="Metropolis-Hastings"):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -692,7 +692,7 @@ class SwendsenWangGlauberGPU:
         num_lit_sat = cp.sum(lit_is_sat, axis=1)
         is_unsat = (num_lit_sat == 0)
 
-        P = 1.0 - cp.exp(-omega)
+        P = 1.0 - cp.exp(-8.0 * omega)
         # 2. Percolation on UNSAT Clauses ONLY
         src_nodes_2 = []
         dst_nodes_2 = []
@@ -926,8 +926,8 @@ clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
 # Solvers
-solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
-solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
+solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=20.0)
+solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=20.0, steps_flips=2*N)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
