@@ -630,7 +630,7 @@ class SwendsenWangGlauberGPU:
         c1_frac = sorted_sizes[0] / (self.N + 1)
         c2_frac = sorted_sizes[1] / (self.N + 1) if n_comps > 1 else 0.0
         if verbose:
-            print(f"Phase 1 Top 3 Clusters: {sorted_sizes[:3]}")
+            print(f"Phase 1 Top 7 Clusters: {sorted_sizes[:7]}")
 
         # --- 2. DYNAMICS (KERNEL) ---
         lit_clusters = labels[self.lits_idx] # (M, 3)
@@ -758,7 +758,7 @@ class SwendsenWangGlauberGPU:
         comp_sizes_2 = cp.bincount(labels_2)
         if verbose:
             sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
-            print(f"Phase 2 Top 3 Clusters: {sorted_sizes_2[:3]}")
+            print(f"Phase 2 Top 7 Clusters: {sorted_sizes_2[:7]}")
 
         # 4. Prepare Kernel Phase 2
         lit_clusters_2 = labels_2[self.lits_idx]
@@ -892,7 +892,7 @@ class CompleteSwendsenWangGPU:
         if verbose:
             comp_sizes = cp.bincount(labels)
             sorted_sizes = cp.sort(comp_sizes)[::-1]
-            print(f"Complete SW Top 3 Clusters: {sorted_sizes[:3]}")
+            print(f"Complete SW Top 7 Clusters: {sorted_sizes[:7]}")
 
         lit_clusters = labels[self.lits_idx]
         
@@ -989,7 +989,7 @@ class CompleteSwendsenWangGPU:
             if verbose:
                 comp_sizes_2 = cp.bincount(labels_2)
                 sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
-                print(f"Complete SW Phase 2 (UNSAT) Top 3 Clusters: {sorted_sizes_2[:3]}")
+                print(f"Complete SW Phase 2 (UNSAT) Top 7 Clusters: {sorted_sizes_2[:7]}")
 
             # Valid Clusters: Variables in UNSAT clauses (including singletons)
             unsat_vars = self.lits_idx[idx_U].flatten()
