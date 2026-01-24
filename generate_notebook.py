@@ -986,6 +986,11 @@ class CompleteSwendsenWangGPU:
                 n_comps_2 = self.N + 1
                 labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
 
+            if verbose:
+                comp_sizes_2 = cp.bincount(labels_2)
+                sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
+                print(f"Complete SW Phase 2 (UNSAT) Top 3 Clusters: {sorted_sizes_2[:3]}")
+
             # Valid Clusters: Variables in UNSAT clauses (including singletons)
             unsat_vars = self.lits_idx[idx_U].flatten()
             relevant_clusters = labels_2[unsat_vars]
