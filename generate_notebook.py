@@ -1089,9 +1089,10 @@ clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
 # Solvers
+facteur_complete = 10
 solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
 solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
-solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
+solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=10.0 * facteur_complete, steps_flips=2*N)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
@@ -1149,7 +1150,7 @@ for i, omega in enumerate(omega_schedule):
     else: history_gl_c2.append(float(c2_gl))
     
     # 3. Complete SW (New)
-    unsat_cp, c1_cp, c2_cp = solver_complete.step(omega, verbose=is_verbose)
+    unsat_cp, c1_cp, c2_cp = solver_complete.step(omega / facteur_complete, verbose=is_verbose)
     
     if hasattr(unsat_cp, 'get'): history_cp.append(float(unsat_cp.get()))
     else: history_cp.append(float(unsat_cp))
