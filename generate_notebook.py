@@ -695,7 +695,7 @@ class SwendsenWangGlauberGPU:
         num_lit_sat = cp.sum(lit_is_sat, axis=1)
         is_unsat = (num_lit_sat == 0)
 
-        P = 1.0 - cp.exp(-8.0 * omega)
+        P = 1.0 - cp.exp(-omega)
         # 2. Percolation on UNSAT Clauses ONLY
         src_nodes_2 = []
         dst_nodes_2 = []
