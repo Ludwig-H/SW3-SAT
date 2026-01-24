@@ -755,8 +755,8 @@ class SwendsenWangGlauberGPU:
             n_comps_2 = self.N + 1
             labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
 
+        comp_sizes_2 = cp.bincount(labels_2)
         if verbose:
-            comp_sizes_2 = cp.bincount(labels_2)
             sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
             print(f"Phase 2 Top 3 Clusters: {sorted_sizes_2[:3]}")
 
