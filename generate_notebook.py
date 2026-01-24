@@ -535,8 +535,8 @@ class SwendsenWangGlauberGPU:
             self.steps_flips = steps_flips
         self.dynamics = dynamics
 
-        self.lits_idx = cp.abs(self.clauses).astype(cp.int32)
-        self.lits_sign = cp.sign(self.clauses).astype(cp.int8)
+        self.lits_idx = cp.ascontiguousarray(cp.abs(self.clauses).astype(cp.int32))
+        self.lits_sign = cp.ascontiguousarray(cp.sign(self.clauses).astype(cp.int8))
 
         s = self.lits_sign
         j01 = cp.where(s[:, 0] == s[:, 1], -1, 1)
@@ -667,9 +667,7 @@ class SwendsenWangGlauberGPU:
             c2v_indptr = cluster_to_vars.indptr.astype(cp.int32)
             c2v_indices = cluster_to_vars.indices.astype(cp.int32)
 
-            lits_idx_ptr = self.lits_idx.astype(cp.int32)
-            lits_sign_ptr = self.lits_sign
-            lit_clusters_ptr = lit_clusters.astype(cp.int32)
+            lit_clusters_ptr = cp.ascontiguousarray(lit_clusters.astype(cp.int32))
 
             seed = int(time.time() * 1000) % 1000000007
 
@@ -679,7 +677,7 @@ class SwendsenWangGlauberGPU:
                     self.sigma,
                     c2c_indptr, c2c_indices,
                     c2v_indptr, c2v_indices,
-                    lits_idx_ptr, lits_sign_ptr,
+                    self.lits_idx, self.lits_sign,
                     lit_clusters_ptr,
                     valid_clusters,
                     cp.int32(num_valid),
@@ -768,10 +766,10 @@ class SwendsenWangGlauberGPU:
         if num_valid_2 > 0:
             c2c_indptr_2 = cluster_to_clauses_2.indptr.astype(cp.int32)
             c2c_indices_2 = cluster_to_clauses_2.indices.astype(cp.int32)
-            c2v_indptr_2 = cluster_to_vars.indptr.astype(cp.int32)
-            c2v_indices_2 = cluster_to_vars.indices.astype(cp.int32)
-            lit_clusters_ptr_2 = lit_clusters_2.astype(cp.int32)
-            self.kernel((1,), (256,), (self.sigma, c2c_indptr_2, c2c_indices_2, c2v_indptr_2, c2v_indices_2, lits_idx_ptr, lits_sign_ptr, lit_clusters_ptr_2, valid_clusters_2, cp.int32(num_valid_2), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed + 1)))
+            c2v_indptr_2 = cluster_to_vars_2.indptr.astype(cp.int32)
+            c2v_indices_2 = cluster_to_vars_2.indices.astype(cp.int32)
+            lit_clusters_ptr_2 = cp.ascontiguousarray(lit_clusters_2.astype(cp.int32))
+            self.kernel((1,), (256,), (self.sigma, c2c_indptr_2, c2c_indices_2, c2v_indptr_2, c2v_indices_2, self.lits_idx, self.lits_sign, lit_clusters_ptr_2, valid_clusters_2, cp.int32(num_valid_2), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed + 1)))
 
         current_energy = self.energy_check()
         
