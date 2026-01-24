@@ -1194,7 +1194,7 @@ solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=15.0 * facte
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
-omega_min = 0.1
+omega_min = 0.25
 omega_max = 0.5
 
 epsilon = 1e-2
