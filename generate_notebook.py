@@ -290,7 +290,7 @@ class StochasticSwendsenWangGPU:
                     mask_a = (~is_marked_lit_sat)
                     if cp.any(mask_a):
                         idx_a = real_idx[mask_a]
-                        mc = marked_col[mask_a]
+                        mc = mc[mask_a]
                         r_choice = cp.random.randint(0, 2, size=len(idx_a))
                         offset = r_choice + 1
                         target_col = (mc + offset) % 3
@@ -301,7 +301,7 @@ class StochasticSwendsenWangGPU:
                     mask_b = (is_marked_lit_sat)
                     if cp.any(mask_b):
                         idx_b = real_idx[mask_b]
-                        mc = marked_col[mask_b]
+                        mc = mc[mask_b]
                         targets = self.lits_idx[idx_b, mc]
                         src_nodes.append(cp.zeros_like(targets))
                         dst_nodes.append(targets)
