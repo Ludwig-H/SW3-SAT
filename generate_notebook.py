@@ -68,12 +68,15 @@ This notebook compares our **Stochastic Cluster Monte Carlo** algorithm against 
     *   Physics-based (Cluster Dynamics).
     *   Uses geometric frustration and percolation.
     *   **New**: Uses **Exact Hamiltonian Cluster Updates** (Exact Energy Delta) for decision.
-    *   **Schedule**: Logarithmic annealing (dense near $\\omega_{max}$).
+    *   **Schedule**: Logarithmic annealing (dense near $\omega_{max}$).
     *   Runs on GPU (Massively Parallel).
 2.  **WalkSAT (Reference)**:
     *   Stochastic Local Search.
     *   Greedy + Noise heuristic.
-    *   Runs on CPU (Sequential, fast flips)."""
+    *   Runs on CPU (Sequential, fast flips).
+3.  **Complete Swendsen-Wang**:
+    *   Applies percolation to ALL clauses (not just SAT ones).
+    *   Uniform percolation logic."""
 add_markdown(md_source_0)
 
 # Cell 1 (Code)
@@ -122,7 +125,7 @@ add_code(code_source_2, execution_count=2, outputs=[])
 code_source_3 = r"""# @title 3. The Solver: `StochasticSwendsenWangGPU`
 
 class StochasticSwendsenWangGPU:
-    def __init__(self, clauses_np, N, beta_scale=15.0):
+    def __init__(self, clauses_np, N, beta_scale=10.0):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -153,7 +156,6 @@ class StochasticSwendsenWangGPU:
         return unsat_frac
 
     def step(self, omega):
-        # print("DEBUG: Executing CORRECTED StochasticSwendsenWangGPU step")
         # 1. Calculate Clause Status
         c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.J_tetra)
@@ -349,7 +351,6 @@ class StochasticSwendsenWangGPU:
             cluster_votes = cp.zeros(n_comps, dtype=cp.int32)
 
             lit_clusters = labels[self.lits_idx] # (M, 3)
-
             is_clause_sat_curr = cp.any(lit_is_sat, axis=1)
 
             # Loop over columns (literals) to simulate flip
@@ -523,7 +524,7 @@ extern "C" __global__ void run_glauber_dynamics(
 '''
 
 class SwendsenWangGlauberGPU:
-    def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, dynamics="Metropolis-Hastings"):
+    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=None, dynamics="Metropolis-Hastings"):
         self.N = N
         self.M = len(clauses_np)
         self.clauses = cp.array(clauses_np)
@@ -754,8 +755,8 @@ class SwendsenWangGlauberGPU:
             n_comps_2 = self.N + 1
             labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
 
-        comp_sizes_2 = cp.bincount(labels_2)
         if verbose:
+            comp_sizes_2 = cp.bincount(labels_2)
             sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
             print(f"Phase 2 Top 3 Clusters: {sorted_sizes_2[:3]}")
 
@@ -799,6 +800,139 @@ class SwendsenWangGlauberGPU:
         
         return current_energy, c1_frac, c2_frac"""
 add_code(code_source_4, execution_count=4, outputs=[])
+
+# Cell 4b (Code)
+code_source_4b = r"""# @title 3c. The Solver: `CompleteSwendsenWangGPU`
+
+class CompleteSwendsenWangGPU:
+    def __init__(self, clauses_np, N, beta_scale=10.0, steps_flips=None, dynamics="Metropolis-Hastings"):
+        self.N = N
+        self.M = len(clauses_np)
+        self.clauses = cp.array(clauses_np)
+        self.beta_scale = beta_scale
+        if steps_flips is None:
+            self.steps_flips = 2 * N
+        else:
+            self.steps_flips = steps_flips
+        self.dynamics = dynamics
+
+        self.lits_idx = cp.ascontiguousarray(cp.abs(self.clauses).astype(cp.int32))
+        self.lits_sign = cp.ascontiguousarray(cp.sign(self.clauses).astype(cp.int8))
+
+        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
+        self.sigma[0] = 1 # Dummy index 0
+        
+        self.best_sigma = self.sigma.copy()
+        self.min_energy = 1.0
+
+        # Reusing the Glauber kernel
+        self.kernel = cp.RawKernel(glauber_kernel_code, 'run_glauber_dynamics', options=('-std=c++17',))
+
+    def energy_check(self):
+        spins = self.sigma[self.lits_idx]
+        is_lit_sat = (spins == self.lits_sign)
+        is_clause_sat = cp.any(is_lit_sat, axis=1)
+        return 1.0 - cp.mean(is_clause_sat)
+
+    def step(self, omega, verbose=False):
+        P = 1.0 - cp.exp(-omega)
+        rand_vals = cp.random.random(self.M, dtype=cp.float32)
+        
+        src_nodes = []
+        dst_nodes = []
+        
+        P_7 = P / 7.0
+        
+        # Range [6P/7, P) -> Full Freeze
+        mask_full = (rand_vals >= 6.0 * P_7) & (rand_vals < P)
+        if cp.any(mask_full):
+            sub_idx = cp.where(mask_full)[0]
+            lits = self.lits_idx[sub_idx]
+            # Edge 0-1
+            src_nodes.append(lits[:, 0])
+            dst_nodes.append(lits[:, 1])
+            # Edge 1-2
+            src_nodes.append(lits[:, 1])
+            dst_nodes.append(lits[:, 2])
+            
+        # Edge 0 (0-1)
+        mask_e0 = (rand_vals < 2.0 * P_7)
+        if cp.any(mask_e0):
+            sub_idx = cp.where(mask_e0)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 0])
+            dst_nodes.append(lits[:, 1])
+            
+        # Edge 1 (1-2)
+        mask_e1 = (rand_vals >= 2.0 * P_7) & (rand_vals < 4.0 * P_7)
+        if cp.any(mask_e1):
+            sub_idx = cp.where(mask_e1)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 1])
+            dst_nodes.append(lits[:, 2])
+            
+        # Edge 2 (2-0)
+        mask_e2 = (rand_vals >= 4.0 * P_7) & (rand_vals < 6.0 * P_7)
+        if cp.any(mask_e2):
+            sub_idx = cp.where(mask_e2)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 2])
+            dst_nodes.append(lits[:, 0])
+
+        if len(src_nodes) > 0:
+            all_src = cp.concatenate(src_nodes)
+            all_dst = cp.concatenate(dst_nodes)
+            data = cp.ones(len(all_src), dtype=cp.float32)
+            adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
+            n_comps, labels = cpx_graph.connected_components(adj, directed=False)
+        else:
+            n_comps = self.N + 1
+            labels = cp.arange(self.N + 1, dtype=cp.int32)
+
+        if verbose:
+            comp_sizes = cp.bincount(labels)
+            sorted_sizes = cp.sort(comp_sizes)[::-1]
+            print(f"Complete SW Top 3 Clusters: {sorted_sizes[:3]}")
+
+        lit_clusters = labels[self.lits_idx]
+        
+        data_v = cp.ones(self.N + 1, dtype=cp.bool_)
+        cluster_to_vars = cpx.coo_matrix((data_v, (labels, cp.arange(self.N + 1))), shape=(n_comps, self.N + 1)).tocsr()
+        
+        flat_clusters = lit_clusters.flatten()
+        flat_clauses = cp.repeat(cp.arange(self.M), 3)
+        combined_keys = flat_clusters.astype(cp.int64) * self.M + flat_clauses.astype(cp.int64)
+        unique_keys = cp.unique(combined_keys)
+        u_clusters = (unique_keys // self.M).astype(cp.int32)
+        u_clauses = (unique_keys % self.M).astype(cp.int32)
+        data_c = cp.ones(len(u_clusters), dtype=cp.bool_)
+        cluster_to_clauses = cpx.coo_matrix((data_c, (u_clusters, u_clauses)), shape=(n_comps, self.M)).tocsr()
+        
+        # Exclude dummy 0
+        ghost_label = labels[0]
+        unique_labels = cp.unique(labels)
+        valid_clusters = unique_labels[unique_labels != ghost_label].astype(cp.int32)
+        num_valid = len(valid_clusters)
+        
+        if num_valid > 0:
+            c2c_indptr = cluster_to_clauses.indptr.astype(cp.int32)
+            c2c_indices = cluster_to_clauses.indices.astype(cp.int32)
+            c2v_indptr = cluster_to_vars.indptr.astype(cp.int32)
+            c2v_indices = cluster_to_vars.indices.astype(cp.int32)
+            lit_clusters_ptr = cp.ascontiguousarray(lit_clusters.astype(cp.int32))
+            
+            seed = int(time.time() * 1000) % 1000000007
+            self.kernel((1,), (256,), (self.sigma, c2c_indptr, c2c_indices, c2v_indptr, c2v_indices, self.lits_idx, self.lits_sign, lit_clusters_ptr, valid_clusters, cp.int32(num_valid), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed)))
+            
+        current_energy = self.energy_check()
+        if current_energy < self.min_energy:
+            self.min_energy = current_energy
+            self.best_sigma = self.sigma.copy()
+            if self.min_energy == 0.0:
+                print("🎉 COMPLETE SOLUTION FOUND ! (Energy = 0.0) 🎉")
+                
+        return current_energy, 0.0, 0.0"""
+add_code(code_source_4b, execution_count=None, outputs=[])
 
 # Cell 5 (Code)
 code_source_5 = r"""# @title 4. Baseline: `WalkSAT` (CPU Optimized)
@@ -955,8 +1089,9 @@ clauses_np, _ = generate_random_3sat(N, alpha, seed=42)
 print(f"Instance: N={N}, M={len(clauses_np)}, Alpha={alpha}")
 
 # Solvers
-solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=15.0)
-solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=15.0, steps_flips=2*N)
+solver = StochasticSwendsenWangGPU(clauses_np, N, beta_scale=10.0)
+solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
+solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=10.0, steps_flips=2*N)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
@@ -977,12 +1112,18 @@ history_gl = [] # Glauber
 history_gl_c1 = []
 history_gl_c2 = []
 
+history_cp = [] # Complete
+history_cp_c1 = []
+history_cp_c2 = []
+
 history_ws = []
 
 t0 = time.time()
 print("Starting Comparison...")
 
 for i, omega in enumerate(omega_schedule):
+    is_verbose = (i % 20 == 0)
+    
     # 1. Stochastic SW (Original)
     unsat_sw, c1_val, c2_val = solver.step(omega)
 
@@ -996,7 +1137,7 @@ for i, omega in enumerate(omega_schedule):
     else: history_c2.append(float(c2_val))
 
     # 2. SW Glauber (New)
-    unsat_gl, c1_gl, c2_gl = solver_gl.step(omega, verbose=(i % 20 == 0))
+    unsat_gl, c1_gl, c2_gl = solver_gl.step(omega, verbose=False)
 
     if hasattr(unsat_gl, 'get'): history_gl.append(float(unsat_gl.get()))
     else: history_gl.append(float(unsat_gl))
@@ -1006,8 +1147,17 @@ for i, omega in enumerate(omega_schedule):
 
     if hasattr(c2_gl, 'get'): history_gl_c2.append(float(c2_gl.get()))
     else: history_gl_c2.append(float(c2_gl))
+    
+    # 3. Complete SW (New)
+    unsat_cp, c1_cp, c2_cp = solver_complete.step(omega, verbose=is_verbose)
+    
+    if hasattr(unsat_cp, 'get'): history_cp.append(float(unsat_cp.get()))
+    else: history_cp.append(float(unsat_cp))
+    
+    if hasattr(c1_cp, 'get'): history_cp_c1.append(float(c1_cp.get()))
+    else: history_cp_c1.append(float(c1_cp))
 
-    # 3. WalkSAT
+    # 4. WalkSAT
     flips_per_step = N//10000
     if flips_per_step < 1: flips_per_step = 1
 
@@ -1018,8 +1168,8 @@ for i, omega in enumerate(omega_schedule):
 
     history_ws.append(e_ws)
 
-    if i % 20 == 0:
-        print(f"Step {i:3d} | Omega {omega:.3f} | SW: {unsat_sw:.6f} (C1={history_c1[-1]:.5f}) | GL: {unsat_gl:.6f} (C1={history_gl_c1[-1]:.5f}) | WS: {e_ws:.6f}")
+    if is_verbose:
+        print(f"Step {i:3d} | Omega {omega:.3f} | SW: {unsat_sw:.6f} | GL: {unsat_gl:.6f} | CP: {unsat_cp:.6f} | WS: {e_ws:.6f}")
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
@@ -1028,33 +1178,37 @@ print(f"Done in {dt:.2f}s")
 omega_cpu = omega_schedule
 sw_cpu = np.array(history_sw)
 gl_cpu = np.array(history_gl)
+cp_cpu = np.array(history_cp)
 ws_cpu = np.array(history_ws)
 c1_cpu = np.array(history_c1)
 c1_gl_cpu = np.array(history_gl_c1)
+c1_cp_cpu = np.array(history_cp_c1)
 
 plt.figure(figsize=(12, 7))
 ax1 = plt.gca()
 
 # Energy Axis
-l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW (Exact)', color='cyan', linewidth=2)
+l1, = ax1.plot(omega_cpu, sw_cpu, label='Stochastic SW', color='cyan', linewidth=2)
 l2, = ax1.plot(omega_cpu, gl_cpu, label='SW + Glauber', color='lime', linewidth=2, linestyle='-')
-l3, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT', color='red', alpha=0.6)
+l3, = ax1.plot(omega_cpu, cp_cpu, label='Complete SW', color='yellow', linewidth=2, linestyle='-')
+l4, = ax1.plot(omega_cpu, ws_cpu, label='WalkSAT', color='red', alpha=0.6)
 
-ax1.set_xlabel(r'Coupling $\\omega$ (Time)')
+ax1.set_xlabel(r'Coupling $\omega$ (Time)')
 ax1.set_ylabel('Fraction Unsatisfied', color='white')
 ax1.tick_params(axis='y', labelcolor='white')
 ax1.grid(True, alpha=0.2)
 
 # Cluster Axis
 ax2 = ax1.twinx()
-l4, = ax2.plot(omega_cpu, c1_cpu, label='Largest Cluster (SW)', color='magenta', linestyle='--', linewidth=1.5)
-l5, = ax2.plot(omega_cpu, c1_gl_cpu, label='Largest Cluster (GL)', color='green', linestyle=':', linewidth=2.0)
+l5, = ax2.plot(omega_cpu, c1_cpu, label='Cluster (SW)', color='magenta', linestyle='--', linewidth=1.5, alpha=0.5)
+l6, = ax2.plot(omega_cpu, c1_gl_cpu, label='Cluster (GL)', color='green', linestyle=':', linewidth=2.0, alpha=0.5)
+l7, = ax2.plot(omega_cpu, c1_cp_cpu, label='Cluster (CP)', color='orange', linestyle=':', linewidth=2.0, alpha=0.5)
 
 ax2.set_ylabel('Cluster Size Fraction', color='white')
 ax2.tick_params(axis='y', labelcolor='white')
 
 # Legend
-lines = [l1, l2, l3, l4, l5]
+lines = [l1, l2, l3, l4, l5, l6, l7]
 labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc='center right')
 
