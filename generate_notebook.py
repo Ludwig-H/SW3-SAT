@@ -1194,8 +1194,8 @@ solver_complete = CompleteSwendsenWangGPU(clauses_np, N, beta_scale=15.0 * facte
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
-omega_min = 0.25
-omega_max = 0.5
+omega_min = 0.5
+omega_max = 1.0
 
 epsilon = 1e-2
 raw_decay = np.geomspace(1, epsilon, steps)
