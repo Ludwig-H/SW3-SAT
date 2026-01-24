@@ -545,6 +545,10 @@ class SwendsenWangGlauberGPU:
 
         self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
         self.sigma[0] = 1
+        
+        # Best So Far
+        self.best_sigma = self.sigma.copy()
+        self.min_energy = 1.0
 
         self.kernel = cp.RawKernel(glauber_kernel_code, 'run_glauber_dynamics', options=('-std=c++17',))
 
@@ -768,7 +772,16 @@ class SwendsenWangGlauberGPU:
             lit_clusters_ptr_2 = lit_clusters_2.astype(cp.int32)
             self.kernel((1,), (256,), (self.sigma, c2c_indptr_2, c2c_indices_2, c2v_indptr_2, c2v_indices_2, lits_idx_ptr, lits_sign_ptr, lit_clusters_ptr_2, valid_clusters_2, cp.int32(num_valid_2), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed + 1)))
 
-        return self.energy_check(), c1_frac, c2_frac"""
+        current_energy = self.energy_check()
+        
+        # Update Best So Far
+        if current_energy < self.min_energy:
+            self.min_energy = current_energy
+            self.best_sigma = self.sigma.copy()
+            if self.min_energy == 0.0:
+                print(f"🎉 SOLUTION FOUND ! (Energy = 0.0) 🎉")
+        
+        return current_energy, c1_frac, c2_frac"""
 add_code(code_source_4, execution_count=4, outputs=[])
 
 # Cell 5 (Code)
