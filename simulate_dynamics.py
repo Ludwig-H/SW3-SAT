@@ -689,6 +689,7 @@ class ConstrainedSwendsenWangErdosRenyiGPU:
 
         self._run_dynamics(labels, n_comps, omega)
         
+        # --- PHASE 2 ---
         c_spins = self.sigma[self.lits_idx]
         lit_is_sat = (c_spins == self.lits_sign)
         is_unsat = (cp.sum(lit_is_sat, axis=1) == 0)
@@ -701,19 +702,24 @@ class ConstrainedSwendsenWangErdosRenyiGPU:
             src_2, dst_2 = [], []
             T1, T2, T3 = 2.0 / 7.0, 4.0 / 7.0, 6.0 / 7.0
             
+            # Full Freeze
             mask_full = (r_vals_U >= T3)
             if cp.any(mask_full):
                 l = self.lits_idx[idx_U[mask_full]]
                 src_2.append(l[:,0]); dst_2.append(l[:,1])
                 src_2.append(l[:,1]); dst_2.append(l[:,2])
+            
+            # Single Edges
             mask_e0 = (r_vals_U < T1)
             if cp.any(mask_e0):
                 l = self.lits_idx[idx_U[mask_e0]]
                 src_2.append(l[:,0]); dst_2.append(l[:,1])
+                
             mask_e1 = (r_vals_U >= T1) & (r_vals_U < T2)
             if cp.any(mask_e1):
                 l = self.lits_idx[idx_U[mask_e1]]
                 src_2.append(l[:,1]); dst_2.append(l[:,2])
+                
             mask_e2 = (r_vals_U >= T2) & (r_vals_U < T3)
             if cp.any(mask_e2):
                 l = self.lits_idx[idx_U[mask_e2]]
@@ -1407,29 +1413,37 @@ class DynamicsUNSAT_GPU:
         if cp.any(is_unsat):
             omega_2 = 8.0 * omega
             P_2 = 1.0 - cp.exp(-omega_2)
-            P_7 = P_2 / 7.0 # 2P/7 for each edge
-            T_freeze = 2.0 * P_7 
+            P_7 = P_2 / 7.0 
             
             idx_U = cp.where(is_unsat)[0]
             n_unsat = len(idx_U)
             r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
             src_2, dst_2 = [], []
             
-            # Edge 0
-            mask_e0 = (r_vals_U < T_freeze)
+            # --- FULL FREEZE (TRIANGLE) --- [0, P/7)
+            mask_full = (r_vals_U < P_7)
+            if cp.any(mask_full):
+                l = self.lits_idx[idx_U[mask_full]]
+                # Edge 0-1
+                src_2.append(l[:,0]); dst_2.append(l[:,1])
+                # Edge 1-2
+                src_2.append(l[:,1]); dst_2.append(l[:,2])
+                # Edge 2-0 (Implicit via transitivity, but we add 2 edges to link 3 nodes)
+            
+            # --- SINGLE EDGE 0 --- [P/7, 3P/7)
+            mask_e0 = (r_vals_U >= P_7) & (r_vals_U < 3.0 * P_7)
             if cp.any(mask_e0):
                 l = self.lits_idx[idx_U[mask_e0]]
                 src_2.append(l[:,0]); dst_2.append(l[:,1])
             
-            # Edge 1 (Independent probability? Prompt implies mutually exclusive "prob 2P/7 gèle 1ere, prob 2P/7 gèle 2eme...")
-            # If so, ranges are [0, 2/7), [2/7, 4/7), [4/7, 6/7).
-            
-            mask_e1 = (r_vals_U >= T_freeze) & (r_vals_U < 2.0 * T_freeze)
+            # --- SINGLE EDGE 1 --- [3P/7, 5P/7)
+            mask_e1 = (r_vals_U >= 3.0 * P_7) & (r_vals_U < 5.0 * P_7)
             if cp.any(mask_e1):
                 l = self.lits_idx[idx_U[mask_e1]]
                 src_2.append(l[:,1]); dst_2.append(l[:,2])
                 
-            mask_e2 = (r_vals_U >= 2.0 * T_freeze) & (r_vals_U < 3.0 * T_freeze)
+            # --- SINGLE EDGE 2 --- [5P/7, 7P/7)
+            mask_e2 = (r_vals_U >= 5.0 * P_7) & (r_vals_U < P_2) # Use P_2 to catch float errors
             if cp.any(mask_e2):
                 l = self.lits_idx[idx_U[mask_e2]]
                 src_2.append(l[:,2]); dst_2.append(l[:,0])
