@@ -696,6 +696,7 @@ class ConstrainedSwendsenWangErdosRenyiGPU:
         
         if cp.any(is_unsat):
             omega_2 = 8.0 * omega
+            
             idx_U = cp.where(is_unsat)[0]
             n_unsat = len(idx_U)
             r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
@@ -767,6 +768,217 @@ class ConstrainedSwendsenWangErdosRenyiGPU:
                     print(f"Phase 2: {n_comps_2} clusters -> {final_n_comps} super-clusters (Active). Top 20 sizes: {top20_2}")
 
             self._run_dynamics(final_labels, final_n_comps, omega_2)
+
+        e = self.energy_check()
+        if e < self.min_energy:
+            self.min_energy = e
+            self.best_sigma = self.sigma.copy()
+            if e == 0.0:
+                print(f"🎉 SOLUTION FOUND ! (Energy = 0.0) 🎉")
+        
+        return e, 0.0, 0.0
+
+class SwendsenWangCompleteErdosRenyiGPU:
+    def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, a=0.9, dynamics="Metropolis-Hastings"):
+        self.N = N
+        self.M = len(clauses_np)
+        self.clauses = cp.array(clauses_np)
+        self.beta_scale = beta_scale
+        self.a = a
+        if steps_flips is None:
+            self.steps_flips = 2 * N
+        else:
+            self.steps_flips = steps_flips
+        self.dynamics = dynamics
+
+        self.lits_idx = cp.ascontiguousarray(cp.abs(self.clauses).astype(cp.int32))
+        self.lits_sign = cp.ascontiguousarray(cp.sign(self.clauses).astype(cp.int8))
+
+        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
+        self.sigma[0] = 1 
+        
+        self.best_sigma = self.sigma.copy()
+        self.min_energy = 1.0
+
+        # Reusing the Glauber kernel
+        self.kernel = cp.RawKernel(metropolis_kernel_code, 'run_metropolis_dynamics', options=('-std=c++17',))
+
+    def energy_check(self):
+        spins = self.sigma[self.lits_idx]
+        is_lit_sat = (spins == self.lits_sign)
+        is_clause_sat = cp.any(is_lit_sat, axis=1)
+        return 1.0 - cp.mean(is_clause_sat)
+
+    def _run_dynamics(self, labels, n_comps, omega):
+        lit_clusters = labels[self.lits_idx]
+        valid_clusters = cp.unique(labels).astype(cp.int32)
+        valid_clusters = valid_clusters[valid_clusters >= 0]
+        num_valid = len(valid_clusters)
+        
+        if num_valid == 0: return
+
+        valid_mask_v = (labels >= 0)
+        active_vars = cp.where(valid_mask_v)[0]
+        active_labels = labels[valid_mask_v]
+        if len(active_vars) == 0: return
+        data_v = cp.ones(len(active_vars), dtype=cp.bool_)
+        cluster_to_vars = cpx.coo_matrix((data_v, (active_labels, active_vars)), shape=(n_comps, self.N + 1)).tocsr()
+
+        flat_clusters = lit_clusters.flatten()
+        flat_clauses = cp.repeat(cp.arange(self.M), 3)
+        mask_c = (flat_clusters >= 0)
+        flat_clusters = flat_clusters[mask_c]
+        flat_clauses = flat_clauses[mask_c]
+        if len(flat_clusters) == 0: return
+        combined_keys = flat_clusters.astype(cp.int64) * self.M + flat_clauses.astype(cp.int64)
+        unique_keys = cp.unique(combined_keys)
+        u_clusters = (unique_keys // self.M).astype(cp.int32)
+        u_clauses = (unique_keys % self.M).astype(cp.int32)
+        data_c = cp.ones(len(u_clusters), dtype=cp.bool_)
+        cluster_to_clauses = cpx.coo_matrix((data_c, (u_clusters, u_clauses)), shape=(n_comps, self.M)).tocsr()
+
+        c2c_indptr = cluster_to_clauses.indptr.astype(cp.int32)
+        c2c_indices = cluster_to_clauses.indices.astype(cp.int32)
+        c2v_indptr = cluster_to_vars.indptr.astype(cp.int32)
+        c2v_indices = cluster_to_vars.indices.astype(cp.int32)
+        lit_clusters_ptr = cp.ascontiguousarray(lit_clusters.astype(cp.int32))
+        
+        seed = int(time.time() * 1000) % 1000000007
+        self.kernel((1,), (256,), (self.sigma, c2c_indptr, c2c_indices, c2v_indptr, c2v_indices, self.lits_idx, self.lits_sign, lit_clusters_ptr, valid_clusters, cp.int32(num_valid), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed)))
+
+    def step(self, omega, verbose=False):
+        P = 1.0 - cp.exp(-omega)
+        rand_vals = cp.random.random(self.M, dtype=cp.float32)
+        src_nodes, dst_nodes = [], []
+        P_7 = P / 7.0
+        
+        mask_full = (rand_vals >= 6.0 * P_7) & (rand_vals < P)
+        if cp.any(mask_full):
+            sub_idx = cp.where(mask_full)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 0]); dst_nodes.append(lits[:, 1])
+            src_nodes.append(lits[:, 1]); dst_nodes.append(lits[:, 2])
+        mask_e0 = (rand_vals < 2.0 * P_7)
+        if cp.any(mask_e0):
+            sub_idx = cp.where(mask_e0)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 0]); dst_nodes.append(lits[:, 1])
+        mask_e1 = (rand_vals >= 2.0 * P_7) & (rand_vals < 4.0 * P_7)
+        if cp.any(mask_e1):
+            sub_idx = cp.where(mask_e1)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 1]); dst_nodes.append(lits[:, 2])
+        mask_e2 = (rand_vals >= 4.0 * P_7) & (rand_vals < 6.0 * P_7)
+        if cp.any(mask_e2):
+            sub_idx = cp.where(mask_e2)[0]
+            lits = self.lits_idx[sub_idx]
+            src_nodes.append(lits[:, 2]); dst_nodes.append(lits[:, 0])
+
+        if len(src_nodes) > 0:
+            all_src = cp.concatenate(src_nodes)
+            all_dst = cp.concatenate(dst_nodes)
+            data = cp.ones(len(all_src), dtype=cp.float32)
+            adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
+            n_comps, labels = cpx_graph.connected_components(adj, directed=False)
+        else:
+            n_comps = self.N + 1
+            labels = cp.arange(self.N + 1, dtype=cp.int32)
+
+        m = n_comps
+        final_labels_1 = labels
+        final_n_comps_1 = n_comps
+        if m > 1 and self.a > 0:
+            num_edges = int(self.a * (m - 1) / 2)
+            if num_edges > 0:
+                s_er = cp.random.randint(0, m, size=num_edges, dtype=cp.int32)
+                d_er = cp.random.randint(0, m, size=num_edges, dtype=cp.int32)
+                data_er = cp.ones(num_edges, dtype=cp.float32)
+                adj_er = cpx.coo_matrix((data_er, (s_er, d_er)), shape=(m, m))
+                n_super, super_labels = cpx_graph.connected_components(adj_er, directed=False)
+                final_labels_1 = super_labels[labels]
+                final_n_comps_1 = n_super
+
+        if verbose:
+            comp_sizes = cp.bincount(final_labels_1)
+            sorted_sizes = cp.sort(comp_sizes)[::-1]
+            print(f"Phase 1 (Complete+ER): {n_comps} clusters -> {final_n_comps_1} super. Top 20: {sorted_sizes[:20]}")
+
+        self._run_dynamics(final_labels_1, final_n_comps_1, omega)
+        
+        # Phase 2
+        c_spins = self.sigma[self.lits_idx]
+        lit_is_sat = (c_spins == self.lits_sign)
+        is_unsat = (cp.sum(lit_is_sat, axis=1) == 0)
+        
+        if cp.any(is_unsat):
+            omega_2 = 8.0 * omega
+            idx_U = cp.where(is_unsat)[0]
+            n_unsat = len(idx_U)
+            r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
+            src_2, dst_2 = [], []
+            P_2 = 1.0 - cp.exp(-omega_2)
+            P_7 = P_2 / 7.0
+            
+            mask_full = (r_vals_U >= 6.0 * P_7) & (r_vals_U < P_2)
+            if cp.any(mask_full):
+                l = self.lits_idx[idx_U[mask_full]]
+                src_2.append(l[:,0]); dst_2.append(l[:,1])
+                src_2.append(l[:,1]); dst_2.append(l[:,2])
+            mask_e0 = (r_vals_U < 2.0 * P_7)
+            if cp.any(mask_e0):
+                l = self.lits_idx[idx_U[mask_e0]]
+                src_2.append(l[:,0]); dst_2.append(l[:,1])
+            mask_e1 = (r_vals_U >= 2.0 * P_7) & (r_vals_U < 4.0 * P_7)
+            if cp.any(mask_e1):
+                l = self.lits_idx[idx_U[mask_e1]]
+                src_2.append(l[:,1]); dst_2.append(l[:,2])
+            mask_e2 = (r_vals_U >= 4.0 * P_7) & (r_vals_U < 6.0 * P_7)
+            if cp.any(mask_e2):
+                l = self.lits_idx[idx_U[mask_e2]]
+                src_2.append(l[:,2]); dst_2.append(l[:,0])
+            if len(src_2) > 0:
+                all_src_2 = cp.concatenate(src_2)
+                all_dst_2 = cp.concatenate(dst_2)
+                data_2 = cp.ones(len(all_src_2), dtype=cp.float32)
+                adj_2 = cpx.coo_matrix((data_2, (all_src_2, all_dst_2)), shape=(self.N + 1, self.N + 1))
+                n_comps_2, labels_2 = cpx_graph.connected_components(adj_2, directed=False)
+            else:
+                n_comps_2 = self.N + 1
+                labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
+                
+            unsat_vars = self.lits_idx[idx_U].flatten()
+            active_clusters = labels_2[unsat_vars]
+            unique_active = cp.unique(active_clusters)
+            ghost_l2 = labels_2[0]
+            unique_active = unique_active[unique_active != ghost_l2]
+            m = len(unique_active)
+            final_labels_2 = labels_2
+            final_n_comps_2 = n_comps_2
+            if m > 1 and self.a > 0:
+                cluster_map = cp.full(n_comps_2, -1, dtype=cp.int32)
+                cluster_map[unique_active] = cp.arange(m, dtype=cp.int32)
+                num_edges = int(self.a * (m - 1) / 2)
+                if num_edges > 0:
+                    s_er = cp.random.randint(0, m, size=num_edges, dtype=cp.int32)
+                    d_er = cp.random.randint(0, m, size=num_edges, dtype=cp.int32)
+                    data_er = cp.ones(num_edges, dtype=cp.float32)
+                    adj_er = cpx.coo_matrix((data_er, (s_er, d_er)), shape=(m, m))
+                    n_super, super_labels = cpx_graph.connected_components(adj_er, directed=False)
+                    mapped_ids = cluster_map[labels_2]
+                    is_active = (mapped_ids != -1)
+                    new_labels = cp.full(self.N + 1, -1, dtype=cp.int32)
+                    new_labels[is_active] = super_labels[mapped_ids[is_active]]
+                    final_labels_2 = new_labels
+                    final_n_comps_2 = n_super
+            
+            if verbose:
+                active_mask = (final_labels_2 != -1)
+                if cp.any(active_mask):
+                    comp_sizes_2 = cp.bincount(final_labels_2[active_mask])
+                    sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
+                    print(f"Phase 2: {n_comps_2} clusters -> {final_n_comps_2} super. Top 20: {sorted_sizes_2[:20]}")
+
+            self._run_dynamics(final_labels_2, final_n_comps_2, omega_2)
 
         e = self.energy_check()
         if e < self.min_energy:
@@ -996,221 +1208,6 @@ class SwendsenWangGlauberGPU:
                 print(f"🎉 SOLUTION FOUND ! (Energy = 0.0) 🎉")
         
         return current_energy, c1_frac, c2_frac
-
-class CompleteSwendsenWangGPU:
-    def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, dynamics="Metropolis-Hastings"):
-        self.N = N
-        self.M = len(clauses_np)
-        self.clauses = cp.array(clauses_np)
-        self.beta_scale = beta_scale
-        if steps_flips is None:
-            self.steps_flips = 2 * N
-        else:
-            self.steps_flips = steps_flips
-        self.dynamics = dynamics
-
-        self.lits_idx = cp.ascontiguousarray(cp.abs(self.clauses).astype(cp.int32))
-        self.lits_sign = cp.ascontiguousarray(cp.sign(self.clauses).astype(cp.int8))
-
-        self.sigma = cp.random.choice(cp.array([-1, 1], dtype=cp.int8), size=N+1)
-        self.sigma[0] = 1 # Dummy index 0
-        
-        self.best_sigma = self.sigma.copy()
-        self.min_energy = 1.0
-
-        # Reusing the Glauber kernel
-        self.kernel = cp.RawKernel(metropolis_kernel_code, 'run_metropolis_dynamics', options=('-std=c++17',))
-
-    def energy_check(self):
-        spins = self.sigma[self.lits_idx]
-        is_lit_sat = (spins == self.lits_sign)
-        is_clause_sat = cp.any(is_lit_sat, axis=1)
-        return 1.0 - cp.mean(is_clause_sat)
-
-    def step(self, omega, verbose=False):
-        P = 1.0 - cp.exp(-omega)
-        rand_vals = cp.random.random(self.M, dtype=cp.float32)
-        
-        src_nodes = []
-        dst_nodes = []
-        
-        P_7 = P / 7.0
-        
-        # Range [6P/7, P) -> Full Freeze
-        mask_full = (rand_vals >= 6.0 * P_7) & (rand_vals < P)
-        if cp.any(mask_full):
-            sub_idx = cp.where(mask_full)[0]
-            lits = self.lits_idx[sub_idx]
-            # Edge 0-1
-            src_nodes.append(lits[:, 0])
-            dst_nodes.append(lits[:, 1])
-            # Edge 1-2
-            src_nodes.append(lits[:, 1])
-            dst_nodes.append(lits[:, 2])
-            
-        # Edge 0 (0-1)
-        mask_e0 = (rand_vals < 2.0 * P_7)
-        if cp.any(mask_e0):
-            sub_idx = cp.where(mask_e0)[0]
-            lits = self.lits_idx[sub_idx]
-            src_nodes.append(lits[:, 0])
-            dst_nodes.append(lits[:, 1])
-            
-        # Edge 1 (1-2)
-        mask_e1 = (rand_vals >= 2.0 * P_7) & (rand_vals < 4.0 * P_7)
-        if cp.any(mask_e1):
-            sub_idx = cp.where(mask_e1)[0]
-            lits = self.lits_idx[sub_idx]
-            src_nodes.append(lits[:, 1])
-            dst_nodes.append(lits[:, 2])
-            
-        # Edge 2 (2-0)
-        mask_e2 = (rand_vals >= 4.0 * P_7) & (rand_vals < 6.0 * P_7)
-        if cp.any(mask_e2):
-            sub_idx = cp.where(mask_e2)[0]
-            lits = self.lits_idx[sub_idx]
-            src_nodes.append(lits[:, 2])
-            dst_nodes.append(lits[:, 0])
-
-        if len(src_nodes) > 0:
-            all_src = cp.concatenate(src_nodes)
-            all_dst = cp.concatenate(dst_nodes)
-            data = cp.ones(len(all_src), dtype=cp.float32)
-            adj = cpx.coo_matrix((data, (all_src, all_dst)), shape=(self.N+1, self.N+1), dtype=cp.float32)
-            n_comps, labels = cpx_graph.connected_components(adj, directed=False)
-        else:
-            n_comps = self.N + 1
-            labels = cp.arange(self.N + 1, dtype=cp.int32)
-
-        if verbose:
-            comp_sizes = cp.bincount(labels)
-            sorted_sizes = cp.sort(comp_sizes)[::-1]
-            print(f"Complete SW Top 7 Clusters: {sorted_sizes[:7]}")
-
-        lit_clusters = labels[self.lits_idx]
-        
-        data_v = cp.ones(self.N + 1, dtype=cp.bool_)
-        cluster_to_vars = cpx.coo_matrix((data_v, (labels, cp.arange(self.N + 1))), shape=(n_comps, self.N + 1)).tocsr()
-        
-        flat_clusters = lit_clusters.flatten()
-        flat_clauses = cp.repeat(cp.arange(self.M), 3)
-        combined_keys = flat_clusters.astype(cp.int64) * self.M + flat_clauses.astype(cp.int64)
-        unique_keys = cp.unique(combined_keys)
-        u_clusters = (unique_keys // self.M).astype(cp.int32)
-        u_clauses = (unique_keys % self.M).astype(cp.int32)
-        data_c = cp.ones(len(u_clusters), dtype=cp.bool_)
-        cluster_to_clauses = cpx.coo_matrix((data_c, (u_clusters, u_clauses)), shape=(n_comps, self.M)).tocsr()
-        
-        # Exclude dummy 0
-        ghost_label = labels[0]
-        unique_labels = cp.unique(labels)
-        valid_clusters = unique_labels[unique_labels != ghost_label].astype(cp.int32)
-        num_valid = len(valid_clusters)
-        
-        if num_valid > 0:
-            c2c_indptr = cluster_to_clauses.indptr.astype(cp.int32)
-            c2c_indices = cluster_to_clauses.indices.astype(cp.int32)
-            c2v_indptr = cluster_to_vars.indptr.astype(cp.int32)
-            c2v_indices = cluster_to_vars.indices.astype(cp.int32)
-            lit_clusters_ptr = cp.ascontiguousarray(lit_clusters.astype(cp.int32))
-            
-            seed = int(time.time() * 1000) % 1000000007
-            self.kernel((1,), (256,), (self.sigma, c2c_indptr, c2c_indices, c2v_indptr, c2v_indices, self.lits_idx, self.lits_sign, lit_clusters_ptr, valid_clusters, cp.int32(num_valid), cp.int32(self.steps_flips), cp.float32(omega), cp.float32(self.beta_scale), cp.uint64(seed)))
-            
-        # --- PHASE 2: UNSAT DYNAMICS (8x Boost) ---
-        c_spins = self.sigma[self.lits_idx]
-        lit_is_sat = (c_spins == self.lits_sign)
-        num_lit_sat = cp.sum(lit_is_sat, axis=1)
-        is_unsat = (num_lit_sat == 0)
-
-        if cp.any(is_unsat):
-            omega_2 = 8.0 * omega
-            P_2 = 1.0 - cp.exp(-omega_2)
-            idx_U = cp.where(is_unsat)[0]
-            n_unsat = len(idx_U)
-            r_vals_U = cp.random.random(n_unsat, dtype=cp.float32)
-            
-            src_nodes_2 = []
-            dst_nodes_2 = []
-            
-            P_7 = P_2 / 7.0
-            
-            mask_full = (r_vals_U >= 6.0 * P_7) & (r_vals_U < P_2)
-            if cp.any(mask_full):
-                sub_idx = idx_U[mask_full]
-                lits = self.lits_idx[sub_idx]
-                src_nodes_2.append(lits[:, 0]); dst_nodes_2.append(lits[:, 1])
-                src_nodes_2.append(lits[:, 1]); dst_nodes_2.append(lits[:, 2])
-
-            mask_e0 = (r_vals_U < 2.0 * P_7)
-            if cp.any(mask_e0):
-                sub_idx = idx_U[mask_e0]
-                lits = self.lits_idx[sub_idx]
-                src_nodes_2.append(lits[:, 0]); dst_nodes_2.append(lits[:, 1])
-
-            mask_e1 = (r_vals_U >= 2.0 * P_7) & (r_vals_U < 4.0 * P_7)
-            if cp.any(mask_e1):
-                sub_idx = idx_U[mask_e1]
-                lits = self.lits_idx[sub_idx]
-                src_nodes_2.append(lits[:, 1]); dst_nodes_2.append(lits[:, 2])
-
-            mask_e2 = (r_vals_U >= 4.0 * P_7) & (r_vals_U < 6.0 * P_7)
-            if cp.any(mask_e2):
-                sub_idx = idx_U[mask_e2]
-                lits = self.lits_idx[sub_idx]
-                src_nodes_2.append(lits[:, 2]); dst_nodes_2.append(lits[:, 0])
-
-            if len(src_nodes_2) > 0:
-                all_src_2 = cp.concatenate(src_nodes_2)
-                all_dst_2 = cp.concatenate(dst_nodes_2)
-                data_2 = cp.ones(len(all_src_2), dtype=cp.float32)
-                adj_2 = cpx.coo_matrix((data_2, (all_src_2, all_dst_2)), shape=(self.N+1, self.N+1), dtype=cp.float32)
-                n_comps_2, labels_2 = cpx_graph.connected_components(adj_2, directed=False)
-            else:
-                n_comps_2 = self.N + 1
-                labels_2 = cp.arange(self.N + 1, dtype=cp.int32)
-
-            if verbose:
-                comp_sizes_2 = cp.bincount(labels_2)
-                sorted_sizes_2 = cp.sort(comp_sizes_2)[::-1]
-                print(f"Complete SW Phase 2 (UNSAT) Top 7 Clusters: {sorted_sizes_2[:7]}")
-
-            unsat_vars = self.lits_idx[idx_U].flatten()
-            relevant_clusters = labels_2[unsat_vars]
-            unique_relevant = cp.unique(relevant_clusters)
-            ghost_label_2 = labels_2[0]
-            valid_clusters_2 = unique_relevant[unique_relevant != ghost_label_2].astype(cp.int32)
-            num_valid_2 = len(valid_clusters_2)
-
-            if num_valid_2 > 0:
-                lit_clusters_2 = labels_2[self.lits_idx]
-                data_v_2 = cp.ones(self.N + 1, dtype=cp.bool_)
-                cluster_to_vars_2 = cpx.coo_matrix((data_v_2, (labels_2, cp.arange(self.N + 1))), shape=(n_comps_2, self.N + 1)).tocsr()
-                flat_clusters_2 = lit_clusters_2.flatten()
-                flat_clauses_2 = cp.repeat(cp.arange(self.M), 3)
-                combined_keys_2 = flat_clusters_2.astype(cp.int64) * self.M + flat_clauses_2.astype(cp.int64)
-                unique_keys_2 = cp.unique(combined_keys_2)
-                u_clusters_2 = (unique_keys_2 // self.M).astype(cp.int32)
-                u_clauses_2 = (unique_keys_2 % self.M).astype(cp.int32)
-                data_c_2 = cp.ones(len(u_clusters_2), dtype=cp.bool_)
-                cluster_to_clauses_2 = cpx.coo_matrix((data_c_2, (u_clusters_2, u_clauses_2)), shape=(n_comps_2, self.M)).tocsr()
-
-                c2c_indptr_2 = cluster_to_clauses_2.indptr.astype(cp.int32)
-                c2c_indices_2 = cluster_to_clauses_2.indices.astype(cp.int32)
-                c2v_indptr_2 = cluster_to_vars_2.indptr.astype(cp.int32)
-                c2v_indices_2 = cluster_to_vars_2.indices.astype(cp.int32)
-                lit_clusters_ptr_2 = cp.ascontiguousarray(lit_clusters_2.astype(cp.int32))
-                
-                self.kernel((1,), (256,), (self.sigma, c2c_indptr_2, c2c_indices_2, c2v_indptr_2, c2v_indices_2, self.lits_idx, self.lits_sign, lit_clusters_ptr_2, valid_clusters_2, cp.int32(num_valid_2), cp.int32(self.steps_flips), cp.float32(omega_2), cp.float32(self.beta_scale), cp.uint64(seed + 100)))
-
-        current_energy = self.energy_check()
-        if current_energy < self.min_energy:
-            self.min_energy = current_energy
-            self.best_sigma = self.sigma.copy()
-            if self.min_energy == 0.0:
-                print("🎉 COMPLETE SOLUTION FOUND ! (Energy = 0.0) 🎉")
-                
-        return current_energy, 0.0, 0.0
 
 class DynamicsUNSAT_GPU:
     def __init__(self, clauses_np, N, beta_scale=15.0, steps_flips=None, a=0.9):
