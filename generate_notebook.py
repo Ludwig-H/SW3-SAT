@@ -110,6 +110,7 @@ solver_er = SwendsenWangErdosRenyiGPU(clauses_np, N, beta_scale=100.0, steps_fli
 solver_constrained = ConstrainedSwendsenWangErdosRenyiGPU(clauses_np, N, beta_scale=100.0, steps_flips=2*N, a=0.9)
 solver_complete_er = SwendsenWangCompleteErdosRenyiGPU(clauses_np, N, beta_scale=100.0, steps_flips=2*N, a=0.9)
 solver_gl = SwendsenWangGlauberGPU(clauses_np, N, beta_scale=100.0, steps_flips=2*N)
+solver_dyn = DynamicsUNSAT_GPU(clauses_np, N, beta_scale=100.0, steps_flips=2*N, a=0.9)
 walksat = WalkSAT(clauses_np, N)
 
 steps = 10000
@@ -126,6 +127,7 @@ history_er = []
 history_const = []
 history_c_er = []
 history_gl = []
+history_dyn = []
 history_ws = []
 
 t0 = time.time()
@@ -149,6 +151,10 @@ for i, omega in enumerate(omega_schedule):
     # 4. SW Glauber
     unsat_gl, _, _ = solver_gl.step(omega, verbose=False)
     history_gl.append(float(unsat_gl.get()) if hasattr(unsat_gl, "get") else float(unsat_gl))
+
+    # 5. Dynamics UNSAT
+    unsat_dyn, _, _ = solver_dyn.step(omega, verbose=is_verbose)
+    history_dyn.append(float(unsat_dyn.get()) if hasattr(unsat_dyn, "get") else float(unsat_dyn))
     
     # 6. WalkSAT
     flips_per_step = N // 10000
@@ -160,10 +166,11 @@ for i, omega in enumerate(omega_schedule):
     history_ws.append(e_ws)
 
     if is_verbose:
-        print(f"Step {i:4d} | w={omega:.3f} | ER: {unsat_er:.5f} | CST: {unsat_const:.5f} | C-ER: {unsat_c_er:.5f} | GL: {unsat_gl:.5f} | WS: {e_ws:.5f}")
+        print(f"Step {i:4d} | w={omega:.3f} | ER: {unsat_er:.5f} | CST: {unsat_const:.5f} | C-ER: {unsat_c_er:.5f} | DYN: {unsat_dyn:.5f} | GL: {unsat_gl:.5f} | WS: {e_ws:.5f}")
         if unsat_c_er == 0.0: print("COMPLETE-ER SOLVED!"); break
         if unsat_const == 0.0: print("CONST SOLVED!"); break
         if unsat_er == 0.0: print("ER SOLVED!"); break
+        if unsat_dyn == 0.0: print("DYN SOLVED!"); break
 
 dt = time.time() - t0
 print(f"Done in {dt:.2f}s")
@@ -174,6 +181,7 @@ er_cpu = np.array(history_er)
 const_cpu = np.array(history_const)
 c_er_cpu = np.array(history_c_er)
 gl_cpu = np.array(history_gl)
+dyn_cpu = np.array(history_dyn)
 ws_cpu = np.array(history_ws)
 
 plt.figure(figsize=(12, 7))
@@ -183,6 +191,7 @@ l1, = ax1.plot(omega_cpu, er_cpu, label="Erdos-Renyi SW", color="cyan", linewidt
 l2, = ax1.plot(omega_cpu, const_cpu, label="Constrained ER-SW", color="magenta", linewidth=1.5, alpha=0.5)
 l3, = ax1.plot(omega_cpu, c_er_cpu, label="Complete ER-SW (New)", color="white", linewidth=2.5)
 l4, = ax1.plot(omega_cpu, gl_cpu, label="Glauber", color="lime", linewidth=1.5, linestyle=":", alpha=0.5)
+l7, = ax1.plot(omega_cpu, dyn_cpu, label="Dynamics UNSAT", color="orange", linewidth=2.0)
 l6, = ax1.plot(omega_cpu, ws_cpu, label="WalkSAT", color="red", alpha=0.5)
 
 ax1.set_xlabel(r"Coupling $\\omega$ (Time)")

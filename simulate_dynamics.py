@@ -1080,9 +1080,11 @@ class SwendsenWangGlauberGPU:
             n_comps = self.N + 1
             labels = cp.arange(self.N + 1, dtype=cp.int32)
 
+        comp_sizes = cp.bincount(labels)
+        sorted_sizes = cp.sort(comp_sizes)[::-1]
+        c1_frac = sorted_sizes[0] / (self.N + 1)
+        c2_frac = sorted_sizes[1] / (self.N + 1) if n_comps > 1 else 0.0
         if verbose:
-            comp_sizes = cp.bincount(labels)
-            sorted_sizes = cp.sort(comp_sizes)[::-1]
             print(f"Phase 1 Top 7 Clusters: {sorted_sizes[:7]}")
 
         lit_clusters = labels[self.lits_idx]
